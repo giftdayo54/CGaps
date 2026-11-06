@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS reference_polygons(
 CREATE TABLE IF NOT EXISTS validations(
   id INTEGER PRIMARY KEY, job_pk INTEGER NOT NULL REFERENCES jobs(id), created_at TEXT, params_json TEXT,
   pooled_json TEXT, ci_json TEXT, fields_json TEXT, skipped_json TEXT, warnings_json TEXT);
+CREATE TABLE IF NOT EXISTS interventions(
+  id INTEGER PRIMARY KEY, farm_pk INTEGER, farm_id TEXT, field_id TEXT, gap_id INTEGER, job_pk INTEGER,
+  version_pk INTEGER, action TEXT, priority TEXT, assigned_to TEXT, target_date TEXT, status TEXT,
+  verified_cause TEXT, proposed_area_ha REAL, actual_area_ha REAL, treatment_date TEXT,
+  est_cost REAL, actual_cost REAL, notes TEXT, created_at TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS models(
+  id INTEGER PRIMARY KEY, name TEXT, created_at TEXT, feature_set TEXT, features_json TEXT, use_s1_change INTEGER,
+  threshold REAL, synthetic INTEGER, n_fields INTEGER, n_pos_samples INTEGER, n_neg_samples INTEGER,
+  field_ids_json TEXT, cv_validated INTEGER, cv_json TEXT, cv_note TEXT, importances_json TEXT,
+  rf_params_json TEXT, provenance_json TEXT, sklearn_version TEXT, path TEXT);
 """
 
 
@@ -349,3 +359,118 @@ def save_validation(conn, job_pk: int, ev: dict) -> int:
 def list_validations(conn, job_pk: int) -> pd.DataFrame:
     return pd.read_sql_query("SELECT id, created_at, params_json, pooled_json, warnings_json FROM validations "
                              "WHERE job_pk=? ORDER BY id DESC", conn, params=(job_pk,))
+
+
+# ----------------------------------------------------------------- interventions
+STATUSES = ["Pending Verification", "Inspected", "Approved", "Scheduled", "Completed", "Rejected"]
+PRIORITIES = ["High", "Medium", "Low"]
+ACTIONS = ["Field verification", "Gap filling or replanting assessment", "Weed-management inspection",
+           "Irrigation-system inspection", "Drainage or waterlogging investigation",
+           "Follow-up satellite or drone monitoring"]
+
+
+def _check_intervention(status, treatment_date, actual_area_ha):
+    if status not in STATUSES:
+        raise ValueError(f"Unknown status '{status}'")
+    if status == "Completed" and (not treatment_date or actual_area_ha is None):
+        raise ValueError("A Completed intervention needs a treatment date and the actual treated area (ha).")
+
+
+def create_intervention(conn, *, farm_pk, farm_id, field_id, action, priority="Medium", gap_id=None, job_pk=None,
+                        version_pk=None, assigned_to=None, target_date=None, status="Pending Verification",
+                        verified_cause=None, proposed_area_ha=None, actual_area_ha=None, treatment_date=None,
+                        est_cost=None, actual_cost=None, notes=None) -> int:
+    if action not in ACTIONS:
+        raise ValueError(f"Unknown action '{action}'")
+    if priority not in PRIORITIES:
+        raise ValueError(f"Unknown priority '{priority}'")
+    _check_intervention(status, treatment_date, actual_area_ha)
+    if gap_id is not None:
+        dup = conn.execute("SELECT id FROM interventions WHERE gap_id=? AND action=? AND status NOT IN "
+                           "('Completed','Rejected')", (gap_id, action)).fetchone()
+        if dup:
+            raise ValueError(f"An open '{action}' intervention already exists for gap {gap_id} (id {dup['id']}).")
+    iid = conn.execute(
+        "INSERT INTO interventions(farm_pk,farm_id,field_id,gap_id,job_pk,version_pk,action,priority,assigned_to,"
+        "target_date,status,verified_cause,proposed_area_ha,actual_area_ha,treatment_date,est_cost,actual_cost,notes,"
+        "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (farm_pk, farm_id, field_id, gap_id, job_pk, version_pk, action, priority, assigned_to,
+         None if target_date is None else str(target_date), status, verified_cause, proposed_area_ha, actual_area_ha,
+         None if treatment_date is None else str(treatment_date), est_cost, actual_cost, notes, now(), now())).lastrowid
+    conn.commit()
+    return iid
+
+
+def update_intervention(conn, iid: int, **kw):
+    cur = conn.execute("SELECT * FROM interventions WHERE id=?", (iid,)).fetchone()
+    if cur is None:
+        raise ValueError(f"No intervention {iid}")
+    allowed = {"action", "priority", "assigned_to", "target_date", "status", "verified_cause", "proposed_area_ha",
+               "actual_area_ha", "treatment_date", "est_cost", "actual_cost", "notes"}
+    kw = {k: (None if v is not None and not isinstance(v, (int, float)) and str(v) in ("", "NaT", "None") else v)
+          for k, v in kw.items() if k in allowed}
+    merged = {**dict(cur), **kw}
+    _check_intervention(merged["status"], merged["treatment_date"], merged["actual_area_ha"])
+    if "action" in kw and kw["action"] not in ACTIONS:
+        raise ValueError(f"Unknown action '{kw['action']}'")
+    if kw:
+        kw = {k: (str(v) if k in ("target_date", "treatment_date") and v is not None else v) for k, v in kw.items()}
+        conn.execute(f"UPDATE interventions SET {', '.join(k + '=?' for k in kw)}, updated_at=? WHERE id=?",
+                     (*kw.values(), now(), iid))
+        conn.commit()
+
+
+def list_interventions(conn, farm_pk=None, field_id=None, status=None, priority=None, date_from=None, date_to=None):
+    q, args = "SELECT * FROM interventions WHERE 1=1", []
+    for col, v in (("farm_pk", farm_pk), ("field_id", field_id), ("status", status), ("priority", priority)):
+        if v:
+            q += f" AND {col}=?"; args.append(v)
+    if date_from:
+        q += " AND target_date>=?"; args.append(str(date_from))
+    if date_to:
+        q += " AND target_date<=?"; args.append(str(date_to))
+    return pd.read_sql_query(q + " ORDER BY CASE priority WHEN 'High' THEN 0 WHEN 'Medium' THEN 1 ELSE 2 END, "
+                             "target_date, id", conn, params=args)
+
+
+def delete_intervention(conn, iid: int):
+    conn.execute("DELETE FROM interventions WHERE id=?", (iid,)); conn.commit()
+
+
+# ----------------------------------------------------------------------- models
+def add_model_row(conn, name, b) -> int:
+    import sklearn
+    m = b.meta
+    mid = conn.execute(
+        "INSERT INTO models(name,created_at,feature_set,features_json,use_s1_change,threshold,synthetic,n_fields,"
+        "n_pos_samples,n_neg_samples,field_ids_json,cv_validated,cv_json,cv_note,importances_json,rf_params_json,"
+        "provenance_json,sklearn_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (name, now(), b.feature_set, json.dumps(b.feature_names), int(b.use_s1_change), b.threshold, int(b.synthetic),
+         m.get("n_fields"), m.get("n_pos_samples"), m.get("n_neg_samples"), json.dumps(m.get("field_ids")),
+         int(bool(m.get("cv"))), json.dumps(m.get("cv"), default=float), m.get("cv_note"),
+         json.dumps(m.get("importances")), json.dumps(m.get("rf_params")), json.dumps(m.get("provenance"), default=str),
+         sklearn.__version__)).lastrowid
+    conn.commit()
+    return mid
+
+
+def set_model_path(conn, mid: int, path: str):
+    conn.execute("UPDATE models SET path=? WHERE id=?", (path, mid)); conn.commit()
+
+
+def list_models(conn) -> pd.DataFrame:
+    return pd.read_sql_query(
+        "SELECT id,name,created_at,feature_set,use_s1_change,threshold,synthetic,n_fields,n_pos_samples,n_neg_samples,"
+        "cv_validated,cv_note FROM models ORDER BY id DESC", conn)
+
+
+def get_model_row(conn, mid: int):
+    return conn.execute("SELECT * FROM models WHERE id=?", (mid,)).fetchone()
+
+
+def delete_model(conn, mid: int):
+    r = get_model_row(conn, mid)
+    if r and r["path"]:
+        from pathlib import Path
+        Path(r["path"]).unlink(missing_ok=True)
+    conn.execute("DELETE FROM models WHERE id=?", (mid,)); conn.commit()

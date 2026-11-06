@@ -108,9 +108,25 @@ def apply_overlap_policy(fields: gpd.GeoDataFrame, policy: str) -> tuple[dict[st
     return res, overlaps
 
 
+def threshold_masks(ix: dict, core: np.ndarray, finite: np.ndarray, p: Params) -> dict:
+    """Baseline rule: low NDVI in absolute terms AND relative to the field's own median."""
+    ndvi = ix["NDVI"]
+    use = core & finite
+    vals = ndvi[use]
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med))) * 1.4826
+    thr = min(p.ndvi_abs_threshold, med - p.robust_z * max(mad, 0.02))
+    cand = use & (ndvi < thr)
+    water = cand & (ix["MNDWI"] > p.mndwi_water) & (ndvi < 0.3)
+    bare = cand & ~water & (ndvi < p.bare_ndvi)
+    sparse = cand & ~water & ~bare
+    return {"use": use, "thr": thr, "med": med, "cand": cand, "water": water, "bare": bare, "sparse": sparse}
+
+
 def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, date_from, date_to,
                   params: Params | None = None, previous_gaps: list | None = None,
-                  previous_date: str | None = None) -> FieldResult:
+                  previous_date: str | None = None, model=None) -> FieldResult:
+    """`model`: optional ml.ModelBundle (Random Forest). None = transparent threshold baseline."""
     p = params or Params()
     if geom_wgs84 is None or geom_wgs84.is_empty:
         return FieldResult(field_id, "unable", "No usable geometry (empty after overlap policy or invalid).")
@@ -143,8 +159,21 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
     except Exception as e:  # noqa: BLE001  (provider failures must not kill the job)
         res.reason = f"Imagery unavailable: {e}"
         return res
-    res.scenes = comp.scenes
+    res.scenes = list(comp.scenes)
     notes += comp.notes
+    comp_s1 = comp_s1b = None
+    if model is not None and model.needs_s1:
+        try:
+            comp_s1 = provider.get_s1_composite(g.bounds, str(utm), date_from, date_to, p.resolution_m, seed_key=field_id)
+            if model.use_s1_change:
+                from . import ml
+                b_from, b_to = ml.baseline_window(date_from, date_to)
+                comp_s1b = provider.get_s1_composite(g.bounds, str(utm), b_from, b_to, p.resolution_m, seed_key=field_id)
+        except Exception as e:  # noqa: BLE001
+            res.reason = f"Sentinel-1 unavailable (required by model {model.label}): {e}"
+            return res
+        res.scenes += comp_s1.scenes
+        notes += comp_s1.notes
 
     h, w = next(iter(comp.bands.values())).shape
     inside = features.geometry_mask([g], out_shape=(h, w), transform=comp.transform, invert=True)
@@ -156,7 +185,12 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
 
     ix = indices(comp.bands)
     ndvi = ix["NDVI"]
-    finite = np.isfinite(ndvi)
+    if model is None:
+        finite = np.isfinite(ndvi)
+    else:
+        from . import ml
+        stack = ml.feature_stack(comp, comp_s1, comp_s1b, core, model.s1_smooth_px)
+        Xarr, finite = ml.to_matrix(stack, model.feature_names)
     n_core = int(core.sum())
     if n_core == 0:
         res.reason = "No pixels fall inside the field."
@@ -177,17 +211,25 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
                       f"(minimum {p.min_valid_fraction:.0%}); cloud/shadow/no-data.")
         return res
 
-    vals = ndvi[core & finite]
-    med = float(np.median(vals))
-    mad = float(np.median(np.abs(vals - med))) * 1.4826
-    thr = min(p.ndvi_abs_threshold, med - p.robust_z * max(mad, 0.02))
-    use = core & finite
-    cand = use & (ndvi < thr)
-    water = cand & (ix["MNDWI"] > p.mndwi_water) & (ndvi < 0.3)
-    bare = cand & ~water & (ndvi < p.bare_ndvi)
-    sparse = cand & ~water & ~bare
-    res.quality.update({"field_median_ndvi": round(med, 3), "ndvi_threshold_used": round(thr, 3),
-                        "sparse_cane_area_ha_not_in_gap_total": round(float(sparse.sum()) * comp.resolution_m ** 2 / M2_PER_HA, 3)})
+    if model is None:
+        tm = threshold_masks(ix, core, finite, p)
+        use, thr, med, cand, water, bare, sparse = (tm[k] for k in ("use", "thr", "med", "cand", "water", "bare", "sparse"))
+        res.quality.update({"method": ALGO_VERSION, "field_median_ndvi": round(med, 3),
+                            "ndvi_threshold_used": round(thr, 3),
+                            "sparse_cane_area_ha_not_in_gap_total": round(float(sparse.sum()) * comp.resolution_m ** 2 / M2_PER_HA, 3)})
+        depth = np.clip((thr - np.nan_to_num(ndvi, nan=thr)) / max(thr, 1e-6), 0, 1)
+    else:
+        use = core & finite
+        proba = np.full((h, w), np.nan, dtype="float32")
+        if use.any():
+            proba[use] = model.predict_proba(Xarr[use])
+        thr = model.threshold
+        cand = use & (proba >= thr)
+        water = (cand & (ix["MNDWI"] > p.mndwi_water) & (ndvi < 0.3)) if model.needs_s2 else np.zeros_like(cand)
+        bare = cand & ~water
+        depth = np.nan_to_num(proba, nan=0.0)
+        res.quality.update({"method": model.label, "model_probability_threshold": thr,
+                            "model_note": "Score = RF predicted probability; not calibrated and not accuracy."})
 
     gap_mask_all = bare | water
     close_px = max(0, int(round(p.merge_distance_m / comp.resolution_m / 2)))
@@ -202,7 +244,6 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
     water_frac_lab = water
 
     detected = end.isoformat()
-    depth = np.clip((thr - np.nan_to_num(ndvi, nan=thr)) / max(thr, 1e-6), 0, 1)
     pieces = []
     for geom_dict, val in features.shapes(gap_mask_all.astype("uint8"), mask=gap_mask_all,
                                           transform=comp.transform, connectivity=8):
@@ -224,7 +265,10 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
         npx = max(int(pm.sum()), 1)
         is_water = float(water_frac_lab[pm].mean()) > 0.5 if pm.any() else False
         category = "Candidate gap - possible waterlogging" if is_water else "Candidate gap"
-        conf = 0.5 * float(depth[pm].mean() if pm.any() else 0) + 0.3 * min(1.0, npx / (4 * mmu_px)) + 0.2 * valid_fraction
+        if model is None:
+            conf = 0.5 * float(depth[pm].mean() if pm.any() else 0) + 0.3 * min(1.0, npx / (4 * mmu_px)) + 0.2 * valid_fraction
+        else:
+            conf = float(depth[pm].mean()) if pm.any() else 0.0
         if prev_union is None:
             change, first = "Uncertain (no baseline)", detected
         else:
@@ -238,7 +282,7 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
             "pct_of_field": gap_percentage(a_m2 / M2_PER_HA, field_ha), "category": category,
             "confidence": round(min(conf, 1.0), 2), "change_status": change, "detected_at": detected,
             "first_observed": first,
-            "method": f"{ALGO_VERSION}{' [SYNTHETIC]' if comp.synthetic else ''}",
+            "method": f"{ALGO_VERSION if model is None else model.label}{' [SYNTHETIC]' if comp.synthetic else ''}",
             "proposed_action": ("Drainage or waterlogging investigation" if is_water else "Field verification"),
         })
     res.gaps.sort(key=lambda d: -d["area_m2"])
@@ -251,17 +295,27 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
 
 def run_analysis(conn, farm_pk: int, version_pk: int, field_ids: list[str], provider: Provider,
                  date_from, date_to, params: Params | None = None, overlap_policy: str = "flag_only",
-                 progress: Callable[[int, int, str], None] | None = None) -> int:
-    """Analyse each selected field independently and persist results. Returns job id."""
+                 progress: Callable[[int, int, str], None] | None = None, model=None) -> int:
+    """Analyse each selected field independently and persist results. Returns job id.
+
+    model: optional ml.ModelBundle. A model trained on synthetic imagery cannot be applied to real imagery
+    (and vice versa)."""
     from . import db
     p = params or Params()
+    if model is not None and bool(model.synthetic) != bool(provider.synthetic):
+        raise ValueError("Model/imagery mismatch: model was trained on "
+                         f"{'SYNTHETIC' if model.synthetic else 'real'} imagery but the source is "
+                         f"{'synthetic' if provider.synthetic else 'real'}.")
     all_fields = db.get_fields(conn, version_pk)
     sel = all_fields[all_fields["field_id"].isin(field_ids) & (all_fields["status"] != "rejected")]
     farm = conn.execute("SELECT * FROM farms WHERE id=?", (farm_pk,)).fetchone()
     geoms, overlaps = apply_overlap_policy(sel, overlap_policy)
     pdict = asdict(p); pdict["n_overlaps"] = len(overlaps); pdict["overlaps"] = overlaps
+    if model is not None:
+        pdict["model"] = {"id": model.meta.get("id"), "label": model.label, "feature_set": model.feature_set,
+                          "threshold": model.threshold, "cv_validated": bool(model.meta.get("cv"))}
     job = db.create_job(conn, farm_pk, version_pk, list(sel["field_id"]), provider.name, provider.synthetic,
-                        date_from, date_to, pdict, ALGO_VERSION, overlap_policy)
+                        date_from, date_to, pdict, ALGO_VERSION if model is None else model.label, overlap_policy)
     try:
         total = len(sel)
         for k, (_, row) in enumerate(sel.iterrows(), 1):
@@ -271,7 +325,7 @@ def run_analysis(conn, farm_pk: int, version_pk: int, field_ids: list[str], prov
                                          "ratoon_number")}
             prev, prev_date = ([], None) if provider.synthetic else db.previous_gaps(conn, farm_pk, row["field_id"], job)
             res = analyse_field(row["field_id"], geoms[row["field_id"]], props, provider, date_from, date_to,
-                                p, prev, prev_date)
+                                p, prev, prev_date, model)
             db.save_field_result(conn, job, version_pk, farm["farm_id"], farm["estate"], res, int(row["row_pk"]))
         if progress:
             progress(total, total, "done")

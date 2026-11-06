@@ -23,13 +23,28 @@ quantification, farm roll-ups, review/verification and GIS exports.
   overlap matching), *field-total level* (predicted vs verified hectares: bias, MAE, RMSE, r). Evaluation excludes the analysis edge
   buffer, flags survey/imagery date gaps, warns about synthetic jobs, edited predictions and small sample sizes, gives bootstrap
   intervals (resampling fields) when >=5 fields, and stores every assessment with its settings.
-- **Tests**: `pytest` (33 tests) incl. import validation, clipping/attribution, aggregation, versioning, exports, validation metrics
+- **Interventions** (sidebar -> Interventions): worklist filterable by status, priority, field and target date; bulk-create
+  'Pending Verification' items from a job's candidate gaps (duplicates refused; priority is an area/score inspection heuristic);
+  manual add/edit with supervisor, action, verified cause, treatment date, actual area and cost (a Completed item needs date and
+  actual area); cost/labour/material estimator driven only by rates you enter. Proposed, estimated and actual values stay separate.
+- **PDF reports** (Results and Review): farm report (summary, field table, largest gaps, intervention workload, validation status)
+  and per-field report (map, polygon table, observation metadata, interventions, method and limitations). Synthetic and
+  unvalidated banners are printed on every report.
+- **Sentinel-1 + Random Forest** (sidebar -> Machine Learning): Sentinel-1 IW GRD retrieval (VV/VH sigma0, orthorectified, linear
+  temporal mean, optional fixed orbit direction), light speckle reduction, features VV/VH dB, VH-VV, RVI, field-relative z-scores
+  and optional temporal change vs the previous equal-length window. Models train **only on fully surveyed reference fields**
+  (pixels near polygon edges ignored). Evaluation holds out **whole fields (or farms)**, is population-weighted, and compares
+  **S2-only vs S1-only vs S1+S2 vs the threshold baseline** on the same held-out pixels. Models are registered with provenance
+  (fields, dates, source, boundary version, parameters, CV or the reason CV was impossible), flagged if trained on synthetic
+  data (refused for real imagery), and can be selected for any analysis run; job reports state the method. No fallback: if a
+  model needs Sentinel-1 and it is unavailable for a field, that field is reported "unable", not silently analysed another way.
+- **Tests**: `pytest` (52 tests) incl. import validation, clipping/attribution, aggregation, versioning, exports, validation metrics
   with hand-computed values, app smoke tests.
 
 ## Not built yet (next stages)
-Sentinel-1 features, supervised ML (the validation module can score it once added), intervention/cost planning, PDF reports, estate dashboards,
+Estate dashboards, spatial-CV beyond field/farm blocks, probability calibration, deep-learning/UAV-trained models,
 swipe/side-by-side imagery, click-on-map field selection, multi-user auth, COG/raster export, background workers.
-The CDSE Sentinel-2 provider is written to the documented Process API but **has not been tested against the live service**.
+The CDSE Sentinel-2 and Sentinel-1 providers are written to the documented Process API but **has not been tested against the live service**.
 
 ## Windows setup
 1. Install Python 3.10-3.12 (python.org) and tick "Add to PATH".
@@ -55,6 +70,12 @@ Other fixtures: `SYNTHETIC_problem_fixture.geojson` (invalid/duplicate/overlap/m
 After the demo run: Validation -> Reference surveys -> upload `sample_data/SYNTHETIC_reference_gaps.geojson` (field ID attribute
 `field_id`), mark F02 and F05 plus any other fully surveyed fields, save; then Accuracy assessment -> Run. These numbers test the
 workflow only. For real use: survey independently of the model, on fields not used to tune thresholds, close in time to the imagery.
+
+## Try the ML workflow (synthetic)
+Machine Learning -> Training data -> source Demo -> *Generate SYNTHETIC reference surveys* -> *Build training set and compare
+feature sets* -> Train and register -> run an analysis choosing the Random Forest method. In demo mode the synthetic radar is
+deliberately weak, so S1-only scores poorly; that is a property of the generator, not of real Sentinel-1.
+**Real use:** record independent field surveys first (Validation section), train on some fields/farms, and validate on others.
 
 ## Real Sentinel-2 data (Copernicus Data Space Ecosystem)
 1. Register at dataspace.copernicus.eu, then create an OAuth client in the Sentinel Hub dashboard.

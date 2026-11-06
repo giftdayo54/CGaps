@@ -60,6 +60,27 @@ function evaluatePixel(samples) {
 """
 
 
+S1_EVALSCRIPT = """//VERSION=3
+function setup() {
+  return {
+    input: [{bands: ["VV", "VH", "dataMask"]}],
+    mosaicking: "ORBIT",
+    output: [{id: "bands", bands: 3, sampleType: "FLOAT32"}]
+  };
+}
+function evaluatePixel(samples) {
+  // temporal mean in the LINEAR domain (never average dB values)
+  var sv = 0, sh = 0, n = 0;
+  for (var i = 0; i < samples.length; i++) {
+    var s = samples[i];
+    if (s.dataMask == 1 && s.VV > 0 && s.VH > 0) { sv += s.VV; sh += s.VH; n++; }
+  }
+  if (n == 0) return {bands: [NaN, NaN, 0]};
+  return {bands: [sv / n, sh / n, n]};
+}
+"""
+
+
 class CDSEUnavailable(RuntimeError):
     pass
 
@@ -145,3 +166,54 @@ class CDSEProvider(Provider):
                      "max_cloud_cover_filter": self.max_cloud_cover}],
             synthetic=False, resolution_m=resolution,
             notes=["B05/B11 are 20 m bands resampled to the 10 m grid by the service."])
+
+    # ------------------------------------------------------------------ Sentinel-1
+    orbit_direction: str | None = None   # "ASCENDING" / "DESCENDING"; mixing geometries adds noise, so set one
+
+    def get_s1_composite(self, bounds, crs, date_from, date_to, resolution=10.0, seed_key=""):
+        """Sentinel-1 IW GRD (VV+VH), orthorectified sigma0 (ellipsoid), temporal mean in linear power.
+
+        UNTESTED against the live service (no credentials in the build environment). The processing block
+        (backCoeff / demInstance / orthorectify) follows the Sentinel Hub Process API documentation; check it
+        against the current CDSE docs. Speckle is reduced by the multi-date mean plus an optional spatial filter
+        applied later in the feature stage; geometry (orbit direction) and soil-moisture/roughness effects still
+        affect backscatter, and S1 alone cannot reliably separate cane from weeds or bare ground.
+        """
+        from rasterio.io import MemoryFile
+        transform, h, w = make_grid(bounds, resolution)
+        if h * w > 2500 * 2500:
+            raise CDSEUnavailable("Field bounding box too large for a single request (max 2500x2500 px).")
+        minx, maxy = transform.c, transform.f
+        bbox = [minx, maxy - h * resolution, minx + w * resolution, maxy]
+        flt = {"timeRange": {"from": f"{date_from}T00:00:00Z", "to": f"{date_to}T23:59:59Z"},
+               "acquisitionMode": "IW", "polarization": "DV", "resolution": "HIGH"}
+        if self.orbit_direction:
+            flt["orbitDirection"] = self.orbit_direction
+        payload = {
+            "input": {"bounds": {"bbox": bbox, "properties": {"crs": f"http://www.opengis.net/def/crs/EPSG/0/{crs.split(':')[-1]}"}},
+                      "data": [{"type": "sentinel-1-grd", "dataFilter": flt,
+                                "processing": {"orthorectify": True, "backCoeff": "SIGMA0_ELLIPSOID",
+                                               "demInstance": "COPERNICUS_30"}}]},
+            "output": {"width": w, "height": h, "responses": [{"identifier": "bands", "format": {"type": "image/tiff"}}]},
+            "evalscript": S1_EVALSCRIPT,
+        }
+        headers = {"Authorization": f"Bearer {self._auth()}"}
+        for attempt in range(3):
+            r = requests.post(PROCESS_URL, json=payload, headers=headers, timeout=self.timeout)
+            if r.status_code == 429:
+                time.sleep(2 ** attempt * 2); continue
+            break
+        if r.status_code != 200:
+            raise CDSEUnavailable(f"Sentinel-1 Process API error HTTP {r.status_code}: {r.text[:300]}")
+        with MemoryFile(r.content) as mf, mf.open() as ds:
+            arr = ds.read().astype("float32")
+        if arr.shape[0] != 3:
+            raise CDSEUnavailable(f"Unexpected S1 response with {arr.shape[0]} bands.")
+        return Composite(
+            bands={"VV": arr[0], "VH": arr[1]}, transform=transform, crs=crs, obs_count=arr[2].astype("uint8"),
+            scenes=[{"sensor": "Sentinel-1 IW GRD", "composite": "linear-power temporal mean, sigma0 ellipsoid, orthorectified",
+                     "orbit_direction": self.orbit_direction or "both (mixed geometry)",
+                     "date_from": str(date_from), "date_to": str(date_to)}],
+            synthetic=False, resolution_m=resolution,
+            notes=[] if self.orbit_direction else ["Ascending and descending passes were mixed; fix the orbit direction "
+                                                   "for consistent viewing geometry."])

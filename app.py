@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
-from canegap import ALGO_VERSION, aggregate, db, exports, validation
+from canegap import ALGO_VERSION, aggregate, db, exports, interventions as iv, ml, reports, validation
 from canegap.geojson_import import (MAPPING_KEYS, CRSNeedsConfirmation, ImportError_, guess_mapping,
                                     parse_geojson, validate_geojson)
 from canegap.pipeline import Params, run_analysis
@@ -43,7 +43,7 @@ def banner_unvalidated():
 
 # =========================================================================== sidebar
 st.sidebar.title("🌾 CaneGap Intelligence")
-page = st.sidebar.radio("Section", ["Farm and Field Explorer", "Results and Review", "Validation", "Method and Limits"])
+page = st.sidebar.radio("Section", ["Farm and Field Explorer", "Results and Review", "Interventions", "Validation", "Machine Learning", "Method and Limits"])
 basemap = st.sidebar.selectbox("Basemap", ["OpenStreetMap", "Esri World Imagery"])
 st.sidebar.caption(f"Algorithm: {ALGO_VERSION}")
 
@@ -261,6 +261,28 @@ def select_and_run(farm_pk: int):
             st.caption("Real Sentinel-2 retrieval - provider code is untested against the live service.")
     else:
         st.info("Demo mode generates **synthetic** imagery for testing. Results are not real observations.")
+    st.markdown("**Detection method**")
+    models_df = db.list_models(conn)
+    method_opts = ["Threshold baseline (transparent rules, Sentinel-2)"] + [
+        f"Random Forest #{r.id}: {r.name} [{r.feature_set}]{' - SYNTHETIC' if r.synthetic else ''}{'' if r.cv_validated else ' - no cross-validation'}"
+        for r in models_df.itertuples()]
+    mchoice = st.selectbox("Method", method_opts, label_visibility="collapsed")
+    bundle = None
+    if mchoice.startswith("Random Forest"):
+        mid = int(mchoice.split("#")[1].split(":")[0])
+        row = db.get_model_row(conn, mid)
+        bundle = ml.load_bundle(row["path"])
+        if bool(bundle.synthetic) != bool(prov.synthetic):
+            st.error("This model was trained on " + ("SYNTHETIC" if bundle.synthetic else "real") + " imagery and cannot be "
+                     "used with the selected source.")
+            can_run = False
+        if not row["cv_validated"]:
+            st.warning("This model has no cross-validation (too few surveyed fields): its quality is unknown.")
+        else:
+            st.caption("Cross-validated internally on held-out fields; still validate on new fields/seasons before relying on it.")
+        if bundle.needs_s1 and src.startswith("Sentinel"):
+            od = st.selectbox("Sentinel-1 orbit direction", ["(mixed - not recommended)", "ASCENDING", "DESCENDING"], index=1)
+            prov.orbit_direction = None if od.startswith("(") else od
     with st.expander("Detection parameters (stored with every job)"):
         p = Params()
         p.ndvi_abs_threshold = st.slider("Absolute NDVI threshold", 0.2, 0.7, p.ndvi_abs_threshold, 0.01)
@@ -276,7 +298,7 @@ def select_and_run(farm_pk: int):
         def cb(i, n, fid):
             bar.progress(i / max(n, 1), text=f"Analysing field {fid} ({i}/{n})")
         try:
-            job = run_analysis(conn, farm_pk, vpk, sorted(S.sel_ids), prov, d_from, d_to, p, policy, cb)
+            job = run_analysis(conn, farm_pk, vpk, sorted(S.sel_ids), prov, d_from, d_to, p, policy, cb, model=bundle)
             S.job_id = job
             bar.progress(1.0, text="Done")
             st.success(f"Job {job} completed. Open 'Results and Review' in the sidebar.")
@@ -330,6 +352,9 @@ def results():
     cols[2].metric("Candidate gap (ha)", f"{s['candidate_gap_area_ha']:,.2f}")
     cols[3].metric("Farm gap %", f"{s['gap_pct']:.2f}%")
     cols[4].metric("Gap polygons", s["n_gap_polygons"])
+    st.caption(f"Method: **{job.algo_version}**" + (" (Random Forest; scores are probabilities, not accuracy)" if "model" in params else ""))
+    if "model" in params and not params["model"].get("cv_validated"):
+        st.warning("This job used a model with no cross-validation; its accuracy is unknown.")
     st.caption(f"Not assessed: {s['n_insufficient_evidence']} insufficient evidence, {s['n_context_excluded']} "
                f"recently harvested/newly planted, {s['n_unable']} unable. Farm % = total gap ha / total analysed ha "
                f"(area-weighted).")
@@ -395,6 +420,16 @@ def results():
         e2.download_button("Shapefile (zip)", exports.to_shapefile_zip(gf), f"{fn}_gaps_shp.zip")
         e3.download_button("GeoPackage", exports.to_gpkg(gf, fields), f"{fn}.gpkg")
         e4.download_button("Gaps CSV", exports.to_csv(gf), f"{fn}_gaps.csv", "text/csv")
+    st.session_state.setdefault("pdf_cache", {})
+    p1, p2, _ = st.columns([1, 1, 4])
+    if p1.button("Build farm PDF report"):
+        S.pdf_cache[(job_pk, "farm")] = reports.farm_report(conn, job_pk)
+    if (job_pk, "farm") in S.pdf_cache:
+        p1.download_button("Download farm PDF", S.pdf_cache[(job_pk, "farm")], f"{fn}_farm_report.pdf", "application/pdf")
+    if fid and p2.button(f"Build field PDF ({fid})"):
+        S.pdf_cache[(job_pk, fid)] = reports.field_report(conn, job_pk, fid)
+    if fid and (job_pk, fid) in S.pdf_cache:
+        p2.download_button(f"Download field PDF ({fid})", S.pdf_cache[(job_pk, fid)], f"{fn}_{fid}_report.pdf", "application/pdf")
     e5.download_button("Fields CSV", exports.to_csv(res), f"{fn}_fields.csv", "text/csv")
     notes = ["CaneGap Intelligence export", f"Job {job_pk}; algorithm {job.algo_version}; boundary version id {job.version_pk}",
              "UNVALIDATED SCREENING OUTPUT - candidate gaps require field verification.",
@@ -424,11 +459,243 @@ x fraction of pixels with valid observations. Farm gap % = total gap ha / total 
 **Limits you should know.** Sentinel-2 is 10 m (red-edge and SWIR bands are native 20 m); gap areas are quantised
 by pixels. Low vegetation index does not prove missing stools (weeds, stress, lodging, shadow, harvest trash, tractor
 tracks and drains can all look similar). The heuristic score is not accuracy. Until compared with field-verified
-polygons this tool is a screening aid only. Sentinel-1 radar and supervised machine learning are not implemented yet.
+polygons this tool is a screening aid only. Random Forest models (Machine Learning section) can use Sentinel-2, Sentinel-1 (VV/VH dB, VH-VV, RVI, optional temporal change) or both; they are trained only on field-verified polygons and compared with this baseline under field-held-out cross-validation. Radar backscatter depends on moisture, roughness and viewing geometry, so S1 alone is not assumed to separate cane from weeds or bare ground.
 
 **Demo mode.** Synthetic imagery is generated so you can test the workflow without credentials. It is not satellite data
 and every output made from it is labelled as such.
 """)
+
+
+def interventions_page():
+    st.title("Intervention management")
+    st.caption("Plan follow-up for candidate gaps. When the cause is unknown the default action is field verification. "
+               "Proposed, estimated and actual values are stored separately.")
+    jobs = db.list_jobs(conn, S.farm_pk) if S.farm_pk else db.list_jobs(conn)
+    farms = db.list_farms(conn)
+    if farms.empty:
+        st.info("Import a farm first."); return
+    flabel = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in farms.itertuples()}
+    fkeys = list(flabel)
+    fcur = next((i for i, k in enumerate(fkeys) if flabel[k] == S.farm_pk), 0)
+    farm_pk = flabel[st.selectbox("Farm", fkeys, index=fcur)]
+    farm = conn.execute("SELECT * FROM farms WHERE id=?", (farm_pk,)).fetchone()
+    t1, t2, t3, t4 = st.tabs(["Worklist", "Create from analysis", "Add / edit", "Cost estimate"])
+
+    with t1:
+        f = st.columns(4)
+        fstat = f[0].selectbox("Status", [""] + db.STATUSES)
+        fpri = f[1].selectbox("Priority", [""] + db.PRIORITIES)
+        ffield = f[2].text_input("Field ID")
+        dr = f[3].date_input("Target date range", value=(), help="Leave empty for all")
+        d_from, d_to = (dr[0], dr[1]) if isinstance(dr, tuple) and len(dr) == 2 else (None, None)
+        df = db.list_interventions(conn, farm_pk, ffield or None, fstat or None, fpri or None, d_from, d_to)
+        if df.empty:
+            st.info("No interventions match.")
+        else:
+            sm = iv.summary(df)
+            a, b, c, d = st.columns(4)
+            a.metric("Items", sm["n"]); b.metric("Proposed area (ha)", f"{sm['proposed_area_ha']:.2f}")
+            c.metric("Actual treated (ha)", f"{sm['actual_treated_area_ha']:.2f}"); d.metric("Actual cost", f"{sm['actual_cost']:,.0f}")
+            st.dataframe(df, hide_index=True, width="stretch")
+            st.download_button("Worklist CSV", exports.to_csv(df), "worklist.csv", "text/csv")
+
+    with t2:
+        done = jobs[jobs.farm_pk == farm_pk] if len(jobs) else jobs
+        if done.empty:
+            st.info("Run an analysis for this farm first.")
+        else:
+            lab = {f"Job {r.id} - {r.created_at[:16]} - {r.source}": int(r.id) for r in done.itertuples()}
+            jp = lab[st.selectbox("Analysis job", list(lab))]
+            c1, c2, c3, c4 = st.columns(4)
+            min_a = c1.number_input("Minimum gap area (ha)", 0.0, 10.0, 0.05, 0.01)
+            min_c = c2.slider("Minimum heuristic score", 0.0, 1.0, 0.0, 0.05)
+            who = c3.text_input("Assign to (team/supervisor)")
+            tgt = c4.date_input("Target completion", date.today() + timedelta(days=14))
+            if st.button("Create worklist from candidate gaps", type="primary"):
+                n, sk = iv.worklist_from_gaps(conn, jp, min_a, min_c, who or None, tgt)
+                st.success(f"Created {n} intervention(s); {len(sk)} skipped (already open or invalid).")
+            st.caption("Priority is a configurable inspection-ranking heuristic (area and score), not a diagnosis.")
+
+    with t3:
+        gaps_df = pd.read_sql_query("SELECT id, field_id, area_ha FROM gaps WHERE farm_id=? ORDER BY id DESC LIMIT 500",
+                                    conn, params=(farm["farm_id"],))
+        vpk = db.current_version(conn, farm_pk)
+        fields = db.get_fields(conn, vpk)
+        with st.form("new_iv"):
+            st.markdown("**New intervention**")
+            c1, c2, c3 = st.columns(3)
+            fid = c1.selectbox("Field", fields.field_id.tolist())
+            gid = c2.selectbox("Gap (optional)", [None] + gaps_df[gaps_df.field_id == fid].id.tolist())
+            action = c3.selectbox("Action", db.ACTIONS)
+            c1, c2, c3 = st.columns(3)
+            pri = c1.selectbox("Priority", db.PRIORITIES, index=1)
+            who = c2.text_input("Assigned supervisor / team")
+            tgt = c3.date_input("Target completion", date.today() + timedelta(days=14), key="nt")
+            prop = st.number_input("Proposed treatment area (ha)", 0.0, 1000.0, 0.0, 0.01)
+            notes = st.text_area("Notes")
+            if st.form_submit_button("Create"):
+                try:
+                    jp = jobs[jobs.farm_pk == farm_pk].iloc[0].id if len(jobs) else None
+                    db.create_intervention(conn, farm_pk=farm_pk, farm_id=farm["farm_id"], field_id=fid, action=action,
+                                           priority=pri, gap_id=gid, job_pk=None if jp is None else int(jp), version_pk=vpk,
+                                           assigned_to=who or None, target_date=tgt, proposed_area_ha=prop or None,
+                                           notes=notes or None)
+                    st.success("Created.")
+                except ValueError as e:
+                    st.error(str(e))
+        df = db.list_interventions(conn, farm_pk)
+        if not df.empty:
+            st.markdown("**Update an intervention**")
+            iid = st.selectbox("Intervention", df.id.tolist(),
+                               format_func=lambda i: f"#{i} {df[df.id == i].iloc[0].field_id} - {df[df.id == i].iloc[0].action}")
+            r = df[df.id == iid].iloc[0]
+            with st.form("upd_iv"):
+                c1, c2, c3 = st.columns(3)
+                status = c1.selectbox("Status", db.STATUSES, index=db.STATUSES.index(r.status))
+                pri = c2.selectbox("Priority", db.PRIORITIES, index=db.PRIORITIES.index(r.priority))
+                who = c3.text_input("Assigned to", value=r.assigned_to or "")
+                cause = st.text_input("Verified cause", value=r.verified_cause or "")
+                c1, c2, c3 = st.columns(3)
+                act_area = c1.number_input("Actual treated area (ha)", 0.0, 1000.0, float(r.actual_area_ha or 0.0), 0.01)
+                tdate = c2.text_input("Treatment date (YYYY-MM-DD)", value=r.treatment_date or "")
+                cost = c3.number_input("Actual cost", 0.0, 1e9, float(r.actual_cost or 0.0), 1.0)
+                notes = st.text_area("Notes", value=r.notes or "")
+                if st.form_submit_button("Save changes"):
+                    try:
+                        db.update_intervention(conn, int(iid), status=status, priority=pri, assigned_to=who or None,
+                                               verified_cause=cause or None, actual_area_ha=act_area if (act_area or status == "Completed") else None,
+                                               treatment_date=tdate or None, actual_cost=cost or None, notes=notes or None)
+                        st.success("Saved."); st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+            if st.button("Delete this intervention"):
+                db.delete_intervention(conn, int(iid)); st.rerun()
+
+    with t4:
+        st.markdown("Enter your own rates; nothing is assumed. Estimates are never mixed with recorded actuals.")
+        c = st.columns(5)
+        rates = iv.Rates(c[0].number_input("Labour days / ha", 0.0, value=0.0), c[1].number_input("Cost / labour day", 0.0, value=0.0),
+                         c[2].number_input("Material units / ha (e.g. t seed cane)", 0.0, value=0.0),
+                         c[3].number_input("Cost / material unit", 0.0, value=0.0), c[4].number_input("Other cost / ha", 0.0, value=0.0))
+        df = db.list_interventions(conn, farm_pk)
+        area = float(df[df.status != "Rejected"].proposed_area_ha.fillna(0).sum()) if not df.empty else 0.0
+        area = st.number_input("Treatment area to estimate (ha)", 0.0, value=area)
+        e = iv.estimate(area, rates)
+        a, b, c2, d = st.columns(4)
+        a.metric("Area (ha)", f"{e['area_ha']:.2f}"); b.metric("Labour days (est.)", f"{e['labour_days']:.1f}")
+        c2.metric("Material units (est.)", f"{e['material_units']:.1f}"); d.metric("Cost (est.)", f"{e['est_cost']:,.0f}")
+
+
+def ml_page():
+    st.title("Machine learning (Random Forest)")
+    st.warning("Models learn from **field-verified polygons you supply**. Scores from few fields are anecdotal; a model is "
+               "only as good as, and only valid for, the seasons/farms it was trained and tested on. Probabilities are "
+               "not accuracy.", icon="⚠️")
+    farms = db.list_farms(conn)
+    if farms.empty:
+        st.info("Import a farm first."); return
+    flabel = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in farms.itertuples()}
+    keys = list(flabel)
+    cur = next((i for i, k in enumerate(keys) if flabel[k] == S.farm_pk), 0)
+    farm_pk = flabel[st.selectbox("Farm (training fields come from its current boundary version)", keys, index=cur)]
+    vpk = db.current_version(conn, farm_pk)
+    fields = db.get_fields(conn, vpk)
+    t1, t2, t3 = st.tabs(["1. Training data and comparison", "2. Train and register", "3. Model registry"])
+
+    with t1:
+        sv = db.list_surveys(conn, vpk)
+        full = sv[sv.fully_surveyed == 1]
+        st.write(f"**{full.field_id.nunique()}** fully surveyed field(s), **{int((full.n_polygons > 0).sum())}** with gap polygons "
+                 f"(record surveys under Validation). Pixels near polygon boundaries are ignored to reduce label noise.")
+        src = st.radio("Imagery source for training", ["Demo (synthetic)", "Sentinel-2 + Sentinel-1 (Copernicus CDSE)"], horizontal=True)
+        prov = DemoProvider(gap_fraction=0.12) if src.startswith("Demo") else CDSEProvider()
+        if not prov.synthetic and not prov.configured:
+            st.error("CDSE credentials not set (see README)."); prov = None
+        if prov is not None and prov.synthetic:
+            st.info("Synthetic mode: you can generate SYNTHETIC reference surveys from the generator to test the workflow. "
+                    "Results say nothing about real performance.")
+            if st.button("Generate SYNTHETIC reference surveys for all fields"):
+                for r in fields.itertuples():
+                    db.add_survey(conn, farm_pk, vpk, r.field_id, date.today(), "SYNTHETIC", "SYNTHETIC truth (demo)", True,
+                                  "generated by demo provider", prov.truth_polygons(r.geometry, r.field_id))
+                st.success("Created."); st.rerun()
+        c = st.columns(4)
+        d_from = c[0].date_input("Imagery from", date.today() - timedelta(days=60), key="ml_from")
+        d_to = c[1].date_input("Imagery to", date.today(), key="ml_to")
+        use_change = c[2].checkbox("Add S1 change features (vs previous window)")
+        ignore = c[3].number_input("Ignore band at polygon edges (m)", 0.0, 50.0, 10.0, 5.0)
+        c = st.columns(3)
+        per_class = c[0].number_input("Max samples per class per field", 100, 20000, 3000, 100)
+        folds = c[1].number_input("CV folds", 2, 10, 5)
+        grp = c[2].selectbox("Hold out whole", ["field_id", "farm_id"])
+        if st.button("Build training set and compare feature sets", type="primary", disabled=prov is None):
+            with st.spinner("Fetching imagery per surveyed field and sampling pixels..."):
+                df, summ = ml.build_training_set(conn, prov, vpk, d_from, d_to, use_change, ignore_band_m=ignore, max_per_class=int(per_class))
+            S.ml = {"df": df, "summ": summ, "farm_pk": farm_pk, "synthetic": prov.synthetic, "use_change": use_change,
+                    "dates": (str(d_from), str(d_to)), "source": prov.name, "folds": int(folds), "grp": grp}
+            if df.empty:
+                st.error("No training samples: survey fields (with gap polygons) first and check imagery availability.")
+            else:
+                S.ml["cmp"] = ml.compare_feature_sets(df, use_change, n_splits=int(folds), group_col=grp)
+        m = S.get("ml")
+        if m and m["farm_pk"] == farm_pk and not m["df"].empty:
+            st.subheader("Training fields")
+            st.dataframe(m["summ"], hide_index=True, width="stretch")
+            st.subheader("Cross-validation: held-out whole " + m["grp"].replace("_id", "s"))
+            st.dataframe(m["cmp"].round(3), hide_index=True, width="stretch")
+            st.caption("Pixel-level, population-weighted, before morphological filtering; baseline is the transparent threshold rule on the "
+                       "same held-out pixels. Positive class = verified gap. Sentinel-1 alone is not expected to separate cane from weeds or bare soil.")
+            if m["synthetic"]:
+                st.error("SYNTHETIC data: these numbers only test the workflow.", icon="🧪")
+
+    with t2:
+        m = S.get("ml")
+        if not m or m["farm_pk"] != farm_pk or m["df"].empty:
+            st.info("Build a training set first."); return
+        c = st.columns(4)
+        fset = c[0].selectbox("Feature set", list(ml.FEATURE_SETS), index=2)
+        trees = c[1].number_input("Trees", 50, 2000, 300, 50)
+        leaf = c[2].number_input("Min samples per leaf", 1, 100, 5)
+        thr = c[3].slider("Probability threshold", 0.1, 0.9, 0.5, 0.05,
+                          help="Choose before looking at test scores; tuning it on the evaluation fields inflates them.")
+        name = st.text_input("Model name", f"RF {fset} {date.today()}")
+        if fset != "s2" and "VH_db" not in m["df"].columns:
+            st.error("Training set has no Sentinel-1 features."); return
+        if st.button("Train and register model", type="primary"):
+            try:
+                with st.spinner("Training..."):
+                    rfp = ml.default_rf_params(n_estimators=int(trees), min_samples_leaf=int(leaf))
+                    b = ml.train_model(m["df"], fset, m["use_change"], rfp, thr, m["synthetic"], n_splits=m["folds"], group_col=m["grp"],
+                                       provenance={"source": m["source"], "dates": m["dates"], "boundary_version": vpk,
+                                                   "training_fields": sorted(m["df"].field_id.unique().tolist())})
+                    mid = ml.register_model(conn, b, name, db.data_dir() / "models")
+                st.success(f"Registered model #{mid}.")
+                if b.meta["cv"]:
+                    r = b.meta["cv"]["rf"]
+                    st.write(f"Held-out CV: precision {r['precision']:.2f}, recall {r['recall']:.2f}, F1 {r['f1']:.2f}, IoU {r['iou']:.2f}, "
+                             f"AUC {r['auc']:.2f} over {b.meta['cv']['n_groups']} groups.")
+                else:
+                    st.warning("Not cross-validated: " + b.meta["cv_note"])
+                st.bar_chart(pd.Series(b.meta["importances"], name="importance"))
+                st.caption("Impurity importances are indicative only and favour correlated/continuous features.")
+            except ml.InsufficientData as e:
+                st.error(str(e))
+
+    with t3:
+        mdf = db.list_models(conn)
+        if mdf.empty:
+            st.info("No models yet."); return
+        st.dataframe(mdf, hide_index=True, width="stretch")
+        mid = st.selectbox("Inspect model", mdf.id.tolist())
+        row = db.get_model_row(conn, int(mid))
+        st.json({"features": json.loads(row["features_json"]), "provenance": json.loads(row["provenance_json"] or "{}"),
+                 "rf_params": json.loads(row["rf_params_json"] or "{}"), "sklearn": row["sklearn_version"],
+                 "cv_note": row["cv_note"], "cv": json.loads(row["cv_json"]) if row["cv_json"] and row["cv_json"] != "null" else None},
+                expanded=False)
+        st.caption("Model files are pickles: only load files created by this app. Applying a model to a different season, region or "
+                   "sensor geometry requires new validation.")
+        if st.button("Delete this model"):
+            db.delete_model(conn, int(mid)); st.rerun()
 
 
 def fmt(x, d=3):
@@ -569,5 +836,5 @@ def validation_page():
                 "score on different ones.")
 
 
-{"Farm and Field Explorer": explorer, "Results and Review": results, "Validation": validation_page,
+{"Farm and Field Explorer": explorer, "Results and Review": results, "Interventions": interventions_page, "Validation": validation_page, "Machine Learning": ml_page,
  "Method and Limits": method}[page]()

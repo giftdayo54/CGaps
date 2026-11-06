@@ -32,6 +32,10 @@ def make_grid(bounds: tuple[float, float, float, float], res: float = 10.0, pad:
     return from_origin(minx, maxy, res, res), height, width
 
 
+class ProviderCapabilityError(RuntimeError):
+    """The provider does not offer the requested data type."""
+
+
 class Provider(ABC):
     name = "base"
     synthetic = False
@@ -40,3 +44,8 @@ class Provider(ABC):
     def get_composite(self, bounds, crs: str, date_from, date_to, resolution: float = 10.0,
                       seed_key: str = "") -> Composite:
         """Return a multi-date composite on a grid covering `bounds` (in `crs`)."""
+
+    def get_s1_composite(self, bounds, crs: str, date_from, date_to, resolution: float = 10.0,
+                         seed_key: str = "") -> Composite:
+        """Sentinel-1 composite: bands {'VV','VH'} as linear backscatter (sigma0), NaN = no data."""
+        raise ProviderCapabilityError(f"{self.name} does not provide Sentinel-1 data.")

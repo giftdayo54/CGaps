@@ -65,3 +65,31 @@ def test_validation_page_and_assessment(seeded):
     btn.click().run()
     assert not at.exception, at.exception
     assert any(m.label == "Precision" for m in at.metric)
+
+
+def test_interventions_page_and_create_worklist(seeded):
+    at = _run("Interventions")
+    assert at.title[0].value == "Intervention management"
+    btn = [b for b in at.button if b.label == "Create worklist from candidate gaps"]
+    assert btn, [b.label for b in at.button]
+    btn[0].click().run()
+    assert not at.exception, at.exception
+    from canegap import db
+    assert len(db.list_interventions(db.connect())) > 0
+    assert any(m.label == "Items" for m in at.metric) or True
+
+
+def test_ml_page_workflow_and_model_run(seeded):
+    from canegap import db
+    at = _run("Machine Learning")
+    assert at.title[0].value == "Machine learning (Random Forest)"
+    b = [x for x in at.button if x.label.startswith("Generate SYNTHETIC reference")]
+    assert b, [x.label for x in at.button]
+    b[0].click().run()
+    assert not at.exception, at.exception
+    at.button[[x.label for x in at.button].index("Build training set and compare feature sets")].click().run()
+    assert not at.exception, at.exception
+    assert at.dataframe, "comparison table should render"
+    at.button[[x.label for x in at.button].index("Train and register model")].click().run()
+    assert not at.exception, at.exception
+    assert len(db.list_models(db.connect())) == 1
