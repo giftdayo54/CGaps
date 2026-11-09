@@ -29,9 +29,9 @@ PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 EVALSCRIPT = """//VERSION=3
 function setup() {
   return {
-    input: [{bands: ["B03","B04","B05","B08","B11","SCL","dataMask"]}],
+    input: [{bands: ["B02","B03","B04","B05","B08","B11","SCL","dataMask"]}],
     mosaicking: "ORBIT",
-    output: [{id: "bands", bands: 6, sampleType: "FLOAT32"}]
+    output: [{id: "bands", bands: 7, sampleType: "FLOAT32"}]
   };
 }
 function median(a) {
@@ -46,9 +46,9 @@ function evaluatePixel(samples) {
     var s = samples[i];
     if (s.dataMask == 1 && (s.SCL == 4 || s.SCL == 5 || s.SCL == 6 || s.SCL == 7)) ok.push(s);
   }
-  if (ok.length == 0) return {bands: [NaN, NaN, NaN, NaN, NaN, 0]};
+  if (ok.length == 0) return {bands: [NaN, NaN, NaN, NaN, NaN, NaN, 0]};
   var out = [];
-  var names = ["B03","B04","B05","B08","B11"];
+  var names = ["B02","B03","B04","B05","B08","B11"];
   for (var b = 0; b < names.length; b++) {
     var v = [];
     for (var k = 0; k < ok.length; k++) v.push(ok[k][names[b]]);
@@ -156,11 +156,11 @@ class CDSEProvider(Provider):
             raise CDSEUnavailable(f"Process API error HTTP {r.status_code}: {r.text[:300]}")
         with MemoryFile(r.content) as mf, mf.open() as ds:
             arr = ds.read().astype("float32")
-        if arr.shape[0] != 6:
+        if arr.shape[0] != 7:
             raise CDSEUnavailable(f"Unexpected response with {arr.shape[0]} bands.")
         bands = {b: arr[i] for i, b in enumerate(BANDS)}
         return Composite(
-            bands=bands, transform=transform, crs=crs, obs_count=arr[5].astype("uint8"),
+            bands=bands, transform=transform, crs=crs, obs_count=arr[6].astype("uint8"),
             scenes=[{"sensor": "Sentinel-2 L2A", "composite": "per-pixel median of SCL-valid observations",
                      "date_from": str(date_from), "date_to": str(date_to),
                      "max_cloud_cover_filter": self.max_cloud_cover}],

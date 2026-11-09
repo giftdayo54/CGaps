@@ -13,6 +13,7 @@ from typing import Callable
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 from rasterio import features
 from scipy import ndimage as ndi
 from shapely.geometry import shape
@@ -151,9 +152,13 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
             res.status = "context_excluded"
             res.reason = (f"{label} ({d.isoformat()}, {(end - d).days} d before assessment end); low vegetation is "
                           f"expected, so gaps were not assessed. Re-run later in the regrowth/establishment period.")
-            res.quality = {"notes": notes}
+            res.quality = {"notes": notes, "attributes_used": {k: props.get(k) for k in ATTRS}}
             return res
 
+    if _parse_date(props.get("last_harvest_date")) is None and _parse_date(props.get("planting_date")) is None:
+        notes.append("No planting or last-harvest date for this field: the recent-harvest and new-planting rules could not "
+                     "be applied, so a recently harvested or newly planted field could be mapped as gaps. Add the dates "
+                     "(Run Analysis -> Field attributes) and re-run if applicable.")
     try:
         comp = provider.get_composite(g.bounds, str(utm), date_from, date_to, p.resolution_m, seed_key=field_id)
     except Exception as e:  # noqa: BLE001  (provider failures must not kill the job)
@@ -201,7 +206,7 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
         "valid_fraction": round(valid_fraction, 3), "pixel_size_m": comp.resolution_m,
         "median_obs_count": (float(np.median(comp.obs_count[core & finite]))
                              if comp.obs_count is not None and (core & finite).any() else None),
-        "synthetic": comp.synthetic, "notes": notes,
+        "synthetic": comp.synthetic, "notes": notes, "attributes_used": {k: props.get(k) for k in ATTRS},
         "limitations": ("Pixel size and mixed edge pixels limit area precision; low NDVI is not proof of "
                         "missing stools; confidence is heuristic, not accuracy."),
     }
@@ -293,13 +298,27 @@ def analyse_field(field_id: str, geom_wgs84, props: dict, provider: Provider, da
     return res
 
 
-def run_analysis(conn, farm_pk: int, version_pk: int, field_ids: list[str], provider: Provider,
-                 date_from, date_to, params: Params | None = None, overlap_policy: str = "flag_only",
-                 progress: Callable[[int, int, str], None] | None = None, model=None) -> int:
-    """Analyse each selected field independently and persist results. Returns job id.
+ATTRS = ("variety", "ratoon_number", "crop", "planting_date", "last_harvest_date", "irrigation_system")
 
-    model: optional ml.ModelBundle. A model trained on synthetic imagery cannot be applied to real imagery
-    (and vice versa)."""
+
+def _job_fingerprint(farm_pk, version_pk, field_ids, source, date_from, date_to, pdict, label, policy) -> str:
+    import hashlib
+    import json
+    core = {k: v for k, v in pdict.items() if k not in ("n_overlaps", "overlaps")}
+    blob = json.dumps([farm_pk, version_pk, sorted(field_ids), source, str(date_from), str(date_to), core, label, policy],
+                      sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+class DuplicateJob(ValueError):
+    pass
+
+
+def queue_analysis(conn, farm_pk: int, version_pk: int, field_ids: list[str], provider: Provider, date_from, date_to,
+                   params: Params | None = None, overlap_policy: str = "flag_only", model=None,
+                   created_by: str | None = None, status: str = "queued") -> int:
+    """Validate and record a job (status 'queued') without running it. Raises DuplicateJob if an identical job is
+    already queued/running, ValueError for model/imagery mismatches or an empty selection."""
     from . import db
     p = params or Params()
     if model is not None and bool(model.synthetic) != bool(provider.synthetic):
@@ -308,29 +327,77 @@ def run_analysis(conn, farm_pk: int, version_pk: int, field_ids: list[str], prov
                          f"{'synthetic' if provider.synthetic else 'real'}.")
     all_fields = db.get_fields(conn, version_pk)
     sel = all_fields[all_fields["field_id"].isin(field_ids) & (all_fields["status"] != "rejected")]
-    farm = conn.execute("SELECT * FROM farms WHERE id=?", (farm_pk,)).fetchone()
-    geoms, overlaps = apply_overlap_policy(sel, overlap_policy)
+    if sel.empty:
+        raise ValueError("No valid fields selected.")
+    _, overlaps = apply_overlap_policy(sel, overlap_policy)
     pdict = asdict(p); pdict["n_overlaps"] = len(overlaps); pdict["overlaps"] = overlaps
+    # attribute values in force NOW (incl. manual edits) are frozen into the job for traceability
+    pdict["field_attributes"] = {r.field_id: {k: (None if (v is None or (isinstance(v, float) and v != v)) else str(v))
+                                              for k, v in ((c, getattr(r, c)) for c in ATTRS)}
+                                 for r in sel.itertuples()}
     if model is not None:
         pdict["model"] = {"id": model.meta.get("id"), "label": model.label, "feature_set": model.feature_set,
                           "threshold": model.threshold, "cv_validated": bool(model.meta.get("cv"))}
-    job = db.create_job(conn, farm_pk, version_pk, list(sel["field_id"]), provider.name, provider.synthetic,
-                        date_from, date_to, pdict, ALGO_VERSION if model is None else model.label, overlap_policy)
+    label = ALGO_VERSION if model is None else model.label
+    fp = _job_fingerprint(farm_pk, version_pk, list(sel["field_id"]), provider.name, date_from, date_to, pdict, label, overlap_policy)
+    dup = db.active_duplicate(conn, fp)
+    if dup:
+        raise DuplicateJob(f"An identical job (#{dup['id']}) is already queued or running.")
+    return db.create_job(conn, farm_pk, version_pk, list(sel["field_id"]), provider.name, provider.synthetic,
+                         date_from, date_to, pdict, label, overlap_policy, status=status, created_by=created_by,
+                         fingerprint=fp)
+
+
+def execute_job(conn, job_pk: int, provider: Provider, model=None,
+                progress: Callable[[int, int, str], None] | None = None,
+                should_cancel: Callable[[], bool] | None = None) -> str:
+    """Run a queued job: analyse each field independently, persisting after every field.
+    Cancellation is honoured between fields (a field already being retrieved is finished). Returns final status."""
+    import json
+    from . import db
+    job = db.get_job(conn, job_pk)
+    db.set_job_running(conn, job_pk)
+    pd_ = json.loads(job["params_json"])
+    p = Params(**{k: v for k, v in pd_.items() if k in Params.__dataclass_fields__})
+    farm = conn.execute("SELECT * FROM farms WHERE id=?", (job["farm_pk"],)).fetchone()
+    fields = db.get_fields(conn, job["version_pk"])
+    ids = json.loads(job["field_ids"])
+    sel = fields[fields["field_id"].isin(ids)]
+    snapshot = pd_.get("field_attributes", {})
+    geoms, _ = apply_overlap_policy(sel, job["overlap_policy"])
+    total = len(sel)
     try:
-        total = len(sel)
-        for k, (_, row) in enumerate(sel.iterrows(), 1):
+        for k, (_, row) in enumerate(sel.iterrows()):
+            if should_cancel and should_cancel():
+                db.finish_job(conn, job_pk, "cancelled", f"Cancelled by user after {k} of {total} fields; completed fields are kept.")
+                return "cancelled"
+            db.update_job_progress(conn, job_pk, k, total, row["field_id"])
             if progress:
-                progress(k - 1, total, row["field_id"])
-            props = {c: row[c] for c in ("crop", "variety", "planting_date", "last_harvest_date",
-                                         "ratoon_number")}
-            prev, prev_date = ([], None) if provider.synthetic else db.previous_gaps(conn, farm_pk, row["field_id"], job)
-            res = analyse_field(row["field_id"], geoms[row["field_id"]], props, provider, date_from, date_to,
+                progress(k, total, row["field_id"])
+            props = dict(snapshot.get(row["field_id"]) or {c: row[c] for c in ATTRS})      # frozen at queue time
+            prev, prev_date = ([], None) if provider.synthetic else db.previous_gaps(conn, job["farm_pk"], row["field_id"], job_pk)
+            res = analyse_field(row["field_id"], geoms[row["field_id"]], props, provider, job["date_from"], job["date_to"],
                                 p, prev, prev_date, model)
-            db.save_field_result(conn, job, version_pk, farm["farm_id"], farm["estate"], res, int(row["row_pk"]))
+            db.save_field_result(conn, job_pk, job["version_pk"], farm["farm_id"], farm["estate"], res, int(row["row_pk"]))
+        db.update_job_progress(conn, job_pk, total, total, None)
         if progress:
             progress(total, total, "done")
-        db.finish_job(conn, job, "completed")
+        db.finish_job(conn, job_pk, "completed")
+        return "completed"
     except Exception as e:  # noqa: BLE001
-        db.finish_job(conn, job, "failed", str(e))
+        db.finish_job(conn, job_pk, "failed", f"{type(e).__name__}: {e}")
         raise
+
+
+def run_analysis(conn, farm_pk: int, version_pk: int, field_ids: list[str], provider: Provider,
+                 date_from, date_to, params: Params | None = None, overlap_policy: str = "flag_only",
+                 progress: Callable[[int, int, str], None] | None = None, model=None,
+                 created_by: str | None = None) -> int:
+    """Synchronous convenience wrapper: queue + execute in the calling thread. Returns job id.
+
+    model: optional ml.ModelBundle. A model trained on synthetic imagery cannot be applied to real imagery
+    (and vice versa)."""
+    job = queue_analysis(conn, farm_pk, version_pk, field_ids, provider, date_from, date_to, params, overlap_policy,
+                         model, created_by)
+    execute_job(conn, job, provider, model, progress)
     return job

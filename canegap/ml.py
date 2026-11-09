@@ -129,6 +129,7 @@ class ModelBundle:
     threshold: float = 0.5
     synthetic: bool = False
     meta: dict = field(default_factory=dict)
+    calibrator: object = None            # optional probability calibrator (see fit_calibrator)
 
     @property
     def needs_s1(self) -> bool:
@@ -144,7 +145,9 @@ class ModelBundle:
         return f"rf{'#' + str(i) if i else ''}-{self.feature_set}"
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        return self.model.predict_proba(X)[:, list(self.model.classes_).index(1)].astype("float32")
+        p = self.model.predict_proba(X)[:, list(self.model.classes_).index(1)].astype("float32")
+        cal = getattr(self, "calibrator", None)
+        return cal.predict(p).astype("float32") if cal is not None else p
 
 
 def save_bundle(bundle: ModelBundle, path) -> None:
@@ -286,10 +289,90 @@ def cross_validate(df: pd.DataFrame, feature_cols: list[str], rf_params: dict | 
     pooled = _prf(y[ok], (proba[ok] >= threshold).astype(int), w[ok])
     pooled["auc"] = (float(roc_auc_score(y[ok], proba[ok], sample_weight=w[ok])) if len(np.unique(y[ok])) == 2 else float("nan"))
     out = {"group_col": group_col, "n_groups": int(n_groups), "n_samples": int(ok.sum()), "threshold": threshold,
-           "rf": pooled, "folds": folds}
+           "rf": pooled, "folds": folds, "_oof": proba}
     if "baseline_gap" in df:
         out["baseline"] = _prf(y[ok], df.baseline_gap.to_numpy()[ok].astype(int), w[ok])
     return out
+
+
+# --------------------------------------------------------------- calibration
+class Calibrator:
+    """Maps raw RF probabilities to calibrated ones. method: 'sigmoid' (Platt on logit) or 'isotonic'."""
+
+    def __init__(self, method: str, model):
+        self.method, self.model = method, model
+
+    def predict(self, p):
+        p = np.asarray(p, dtype="float64")
+        if self.method == "isotonic":
+            return self.model.predict(p)
+        z = np.log(np.clip(p, 1e-4, 1 - 1e-4) / (1 - np.clip(p, 1e-4, 1 - 1e-4)))
+        return self.model.predict_proba(z.reshape(-1, 1))[:, 1]
+
+
+def fit_calibrator(p, y, w, method: str) -> Calibrator:
+    if method == "isotonic":
+        from sklearn.isotonic import IsotonicRegression
+        return Calibrator(method, IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1).fit(p, y, sample_weight=w))
+    if method == "sigmoid":
+        from sklearn.linear_model import LogisticRegression
+        pp = np.clip(p, 1e-4, 1 - 1e-4)
+        z = np.log(pp / (1 - pp)).reshape(-1, 1)
+        return Calibrator(method, LogisticRegression(C=1e6).fit(z, y, sample_weight=w))
+    raise ValueError("calibration must be 'sigmoid' or 'isotonic'")
+
+
+def reliability_table(p, y, w, n_bins: int = 10) -> pd.DataFrame:
+    """Weighted reliability: mean predicted probability vs observed gap fraction per probability bin."""
+    bins = np.minimum((np.asarray(p) * n_bins).astype(int), n_bins - 1)
+    rows = []
+    for b in range(n_bins):
+        m = bins == b
+        if not m.any():
+            continue
+        ww = w[m]
+        rows.append({"bin": f"{b / n_bins:.1f}-{(b + 1) / n_bins:.1f}", "mean_pred": float(np.average(p[m], weights=ww)),
+                     "observed": float(np.average(y[m], weights=ww)), "weight": float(ww.sum())})
+    return pd.DataFrame(rows)
+
+
+def _brier_ece(p, y, w, n_bins=10):
+    brier = float(np.average((p - y) ** 2, weights=w))
+    t = reliability_table(p, y, w, n_bins)
+    ece = float((t.weight / t.weight.sum() * (t.mean_pred - t.observed).abs()).sum()) if len(t) else float("nan")
+    return brier, ece
+
+
+def calibration_report(p, y, w, groups, method: str, threshold: float = 0.5, n_splits: int = 5) -> tuple[dict, Calibrator]:
+    """Raw vs calibrated reliability using CROSS-FITTING (calibrator fit on other groups, applied to the held-out
+    group) so the reported improvement is not simply an in-sample fit. Returns (report, calibrator fit on all)."""
+    from sklearn.model_selection import GroupKFold
+    ok = np.isfinite(p)
+    p, y, w, groups = p[ok], y[ok], w[ok], np.asarray(groups)[ok]
+    n_groups = len(np.unique(groups))
+    if n_groups < 3 or len(np.unique(y)) < 2:
+        raise InsufficientData("Calibration needs out-of-fold predictions from >= 3 groups with both classes.")
+    pcal = np.full(len(p), np.nan)
+    for tr, te in GroupKFold(n_splits=min(n_splits, n_groups)).split(p, y, groups):
+        if len(np.unique(y[tr])) < 2:
+            continue
+        pcal[te] = fit_calibrator(p[tr], y[tr], w[tr], method).predict(p[te])
+    use = np.isfinite(pcal)
+    if not use.any():
+        raise InsufficientData("Calibration cross-fitting produced no predictions.")
+    b0, e0 = _brier_ece(p[use], y[use], w[use])
+    b1, e1 = _brier_ece(pcal[use], y[use], w[use])
+    report = {
+        "method": method, "n_samples": int(use.sum()),
+        "brier_raw": b0, "brier_calibrated_crossfit": b1, "ece_raw": e0, "ece_calibrated_crossfit": e1,
+        "reliability_raw": reliability_table(p[use], y[use], w[use]).to_dict("records"),
+        "reliability_calibrated": reliability_table(pcal[use], y[use], w[use]).to_dict("records"),
+        "metrics_at_threshold_calibrated": _prf(y[use], (pcal[use] >= threshold).astype(int), w[use]),
+        "note": ("Calibration is estimated against the TRAINING population's gap prevalence (sample weights undo class "
+                 "subsampling); fields with a very different gap rate, a new season or a new sensor setup need re-checking. "
+                 "A calibrated probability is a better-behaved score, not a guarantee of accuracy."),
+    }
+    return report, fit_calibrator(p, y, w, method)
 
 
 def compare_feature_sets(df, use_s1_change=False, sets=FEATURE_SETS, **kw) -> pd.DataFrame:
@@ -315,7 +398,7 @@ def compare_feature_sets(df, use_s1_change=False, sets=FEATURE_SETS, **kw) -> pd
 # ------------------------------------------------------------------ training
 def train_model(df: pd.DataFrame, feature_set: str, use_s1_change: bool = False, rf_params: dict | None = None,
                 threshold: float = 0.5, synthetic: bool = False, s1_smooth_px: int = 3, n_splits: int = 5,
-                group_col: str = "field_id", provenance: dict | None = None) -> ModelBundle:
+                group_col: str = "field_id", provenance: dict | None = None, calibration: str = "none") -> ModelBundle:
     """Fit on ALL samples; attach group-CV metrics if (and only if) CV could be run."""
     from sklearn.ensemble import RandomForestClassifier
     cols = feature_names(feature_set, use_s1_change)
@@ -325,15 +408,29 @@ def train_model(df: pd.DataFrame, feature_set: str, use_s1_change: bool = False,
             "n_pos_samples": int((df.label == 1).sum()), "n_neg_samples": int((df.label == 0).sum()),
             "field_ids": sorted(df.field_id.unique().tolist()), "provenance": provenance or {}, "cv": None,
             "cv_note": ""}
+    oof, calibrator = None, None
     try:
-        meta["cv"] = cross_validate(df, cols, rf_params, n_splits, group_col, threshold)
+        cv = cross_validate(df, cols, rf_params, n_splits, group_col, threshold)
+        oof = cv.pop("_oof")
+        meta["cv"] = cv
     except InsufficientData as e:
         meta["cv_note"] = str(e)
+    meta["calibration"] = None
+    if calibration != "none":
+        if oof is None:
+            meta["calibration_note"] = "Not calibrated: calibration needs cross-validated out-of-fold predictions."
+        else:
+            try:
+                rep, calibrator = calibration_report(oof, df.label.to_numpy(), df.w.to_numpy(), df[group_col].to_numpy(),
+                                                     calibration, threshold, n_splits)
+                meta["calibration"] = rep
+            except InsufficientData as e:
+                meta["calibration_note"] = f"Not calibrated: {e}"
     params = rf_params or default_rf_params()
     m = RandomForestClassifier(**params).fit(df[cols].to_numpy("float32"), df.label.to_numpy())
     meta["importances"] = dict(sorted(zip(cols, map(float, m.feature_importances_)), key=lambda t: -t[1]))
     meta["rf_params"] = {k: (v if isinstance(v, (int, float, str, type(None))) else str(v)) for k, v in params.items()}
-    return ModelBundle(m, cols, feature_set, use_s1_change, s1_smooth_px, threshold, synthetic, meta)
+    return ModelBundle(m, cols, feature_set, use_s1_change, s1_smooth_px, threshold, synthetic, meta, calibrator)
 
 
 def register_model(conn, bundle: ModelBundle, name: str, folder, created_by: str | None = None) -> int:

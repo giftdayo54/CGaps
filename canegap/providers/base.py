@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from rasterio.transform import Affine, from_origin
 
-BANDS = ["B03", "B04", "B05", "B08", "B11"]  # green, red, red-edge1, NIR, SWIR1 (surface reflectance 0-1)
+BANDS = ["B02", "B03", "B04", "B05", "B08", "B11"]  # blue, green, red, red-edge1, NIR, SWIR1 (surface reflectance 0-1)
 
 
 @dataclass

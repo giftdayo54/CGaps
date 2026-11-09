@@ -130,3 +130,12 @@ def test_excel_export_has_expected_sheets(conn):
     res, gaps = db.job_results(conn, job), exports.gaps_with_flag(db.job_gaps(conn, job), True)
     wb = openpyxl.load_workbook(io.BytesIO(exports.to_xlsx(res, gaps, farm_summary(res), ["n"])))
     assert wb.sheetnames == ["README", "Farm summary", "Fields", "Gaps"]
+
+
+def test_saved_boundary_with_rejected_features_loads(conn):
+    """Regression: rejected features have no geometry; loading them back must not crash."""
+    vr = validate_geojson(samples.problem_fixture())
+    ids = db.save_import(conn, vr, "problem.geojson")[0]
+    f = db.get_fields(conn, ids["version_pk"])
+    assert f.geometry.isna().sum() >= 2 and (f.status == "rejected").sum() >= 2
+    assert len(db.list_farms(conn)) == 1

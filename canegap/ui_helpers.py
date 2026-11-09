@@ -71,3 +71,23 @@ def results_map(fields: gpd.GeoDataFrame, results: pd.DataFrame, gaps: gpd.GeoDa
                                            "confidence", "change_status", "verification_status"])).add_to(m)
     folium.LayerControl().add_to(m)
     return m
+
+
+def field_at_point(fields: gpd.GeoDataFrame, lat: float, lng: float) -> str | None:
+    """field_id of the polygon containing a clicked map point (smallest one if several overlap), else None."""
+    from shapely.geometry import Point
+    pt = Point(lng, lat)
+    hit = fields[[g is not None and g.contains(pt) for g in fields.geometry]]
+    if hit.empty:
+        return None
+    areas = [g.area for g in hit.geometry]        # degrees^2 is fine for ranking overlapping candidates
+    return str(hit.iloc[min(range(len(areas)), key=areas.__getitem__)].field_id)
+
+
+def toggle_selection(selected: set, field_id: str, allowed: set | None = None) -> set:
+    """Return a new selection with field_id toggled (fields not in `allowed` are ignored)."""
+    if allowed is not None and field_id not in allowed:
+        return set(selected)
+    out = set(selected)
+    out.symmetric_difference_update({field_id})
+    return out

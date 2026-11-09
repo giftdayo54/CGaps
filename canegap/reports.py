@@ -141,9 +141,11 @@ def field_report(conn, job_pk: int, field_id: str) -> bytes:
     gaps = db.job_gaps(conn, job_pk); gaps = gaps[gaps.field_id == field_id].sort_values("area_ha", ascending=False)
     story = []
     _header(story, conn, job, f"Field report - {field_id}")
-    attrs = {k: fg[k] for k in ("field_name", "crop", "variety", "ratoon_number", "last_harvest_date", "planting_date")
-             if fg[k] is not None and not (isinstance(fg[k], float) and fg[k] != fg[k]) and str(fg[k]) != ""}
-    story.append(_p("Field: " + "; ".join(f"{k} {v}" for k, v in {"ID": field_id, **attrs}.items())))
+    snap = json.loads(job["params_json"] or "{}").get("field_attributes", {}).get(field_id)
+    src = {"field_name": fg["field_name"], **(snap if snap is not None else {k: fg[k] for k in ("crop", "variety", "ratoon_number", "last_harvest_date", "planting_date")})}
+    attrs = {k: src[k] for k in ("field_name", "crop", "variety", "ratoon_number", "last_harvest_date", "planting_date")
+             if k in src and src[k] is not None and not (isinstance(src[k], float) and src[k] != src[k]) and str(src[k]) != ""}
+    story.append(_p("Field (attributes as used by this job): " + "; ".join(f"{k} {v}" for k, v in {"ID": field_id, **attrs}.items())))
     story.append(Spacer(1, 4))
     facts = pd.DataFrame([{
         "Status": r.status, "Field area (ha)": round(r.field_area_ha, 2), "Analysed area (ha)": round(r.analysed_area_ha or 0, 2),

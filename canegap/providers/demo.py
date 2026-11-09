@@ -62,6 +62,7 @@ class DemoProvider(Provider):
             "B03": mix(0.07, 0.15), "B04": mix(0.04, 0.17), "B05": mix(0.12, 0.20),
             "B08": mix(0.42, 0.24), "B11": mix(0.17, 0.30),
         }
+        bands["B02"] = mix(0.03, 0.12)       # added last so earlier bands keep their noise sequence
         valid = np.full((h, w), 3, dtype="uint8")
         if self.cloud_fraction > 0:
             noise = gaussian_filter(rng.normal(size=(h, w)), sigma=8)

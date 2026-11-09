@@ -10,14 +10,17 @@ import folium
 import geopandas as gpd
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 
-from canegap import ALGO_VERSION, aggregate, db, exports, interventions as iv, ml, reports, validation
+from canegap import (ALGO_VERSION, aggregate, attributes, auth, dashboards as dsh, db, exports, imagery, interventions as iv, ml,
+                     rasters, reports, validation)
 from canegap.geojson_import import (MAPPING_KEYS, CRSNeedsConfirmation, ImportError_, guess_mapping,
-                                    parse_geojson, validate_geojson)
-from canegap.pipeline import Params, run_analysis
+                                    parse_geojson, subset_validation, validate_geojson)
+from canegap.jobs import JobRunner
+from canegap.pipeline import DuplicateJob, Params, execute_job, queue_analysis, run_analysis
 from canegap.providers import CDSEProvider, DemoProvider
-from canegap.ui_helpers import base_map, selection_map, results_map
+from canegap.ui_helpers import base_map, field_at_point, results_map, selection_map, toggle_selection
 
 st.set_page_config(page_title="CaneGap Intelligence", page_icon="🌾", layout="wide")
 
@@ -27,6 +30,12 @@ VERIF = ["Pending Verification", "Inspected", "Approved", "Scheduled", "Complete
 @st.cache_resource
 def get_conn():
     return db.connect()
+
+
+@st.cache_resource
+def get_runner():
+    """Process-wide background job runner (also marks jobs orphaned by a restart as 'interrupted')."""
+    return JobRunner(db.data_dir() / "canegap.sqlite", max_workers=2)
 
 
 conn = get_conn()
@@ -41,14 +50,125 @@ def banner_unvalidated():
                "No accuracy has been measured; verify in the field before operational decisions.", icon="⚠️")
 
 
-# =========================================================================== sidebar
+# =========================================================================== auth + sidebar
+AUTH = auth.enabled()
+
+
+def log(action: str, detail: str = ""):
+    if AUTH:
+        auth.audit(conn, S.get("user", {}).get("username"), action, detail)
+
+
+def login_screen():
+    st.title("🌾 CaneGap Intelligence")
+    if not auth.has_users(conn):
+        st.subheader("First-time setup: create the administrator account")
+        with st.form("first_admin"):
+            u = st.text_input("Username")
+            pw = st.text_input(f"Password (min {auth.MIN_PW_LEN} characters, letters and digits)", type="password")
+            pw2 = st.text_input("Repeat password", type="password")
+            if st.form_submit_button("Create administrator", type="primary"):
+                try:
+                    if pw != pw2:
+                        raise auth.AuthError("Passwords do not match.")
+                    auth.create_user(conn, u, pw, "admin")
+                    st.success("Administrator created. Sign in below.")
+                    st.rerun()
+                except auth.AuthError as e:
+                    st.error(str(e))
+        return
+    with st.form("login"):
+        u = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        if st.form_submit_button("Sign in", type="primary"):
+            try:
+                S.user = auth.authenticate(conn, u, pw)
+                st.rerun()
+            except auth.AuthError as e:
+                st.error(str(e))
+    st.caption("Accounts are created by an administrator. Use HTTPS when deploying.")
+
+
+if AUTH:
+    auth.seed_admin_from_env(conn)
+    if S.get("user") is None:
+        login_screen()
+        st.stop()
+    user = auth.get_user(conn, S.user["username"])
+    if user is None or not user["active"]:            # deactivated while signed in
+        S.pop("user", None); st.rerun()
+    S.user = user
+else:
+    user = {"id": 0, "username": "local", "display_name": "Local user", "role": "admin", "active": 1, "all_farms": 1,
+            "farms": [], "must_change_pw": 0}
+ROLE = user["role"]
+RO = not auth.can(ROLE, "write")
+ALLOWED = auth.allowed_farms(user)
+
+if AUTH and user["must_change_pw"]:
+    st.title("Change your password")
+    st.info("An administrator reset your password. Choose a new one to continue.")
+    with st.form("force_pw"):
+        old = st.text_input("Current password", type="password")
+        new = st.text_input("New password", type="password")
+        if st.form_submit_button("Change password", type="primary"):
+            try:
+                auth.change_password(conn, user["username"], old, new)
+                st.rerun()
+            except auth.AuthError as e:
+                st.error(str(e))
+    st.stop()
+
+PAGES = ["Farm and Field Explorer", "Run Analysis", "Results and Review", "Dashboards", "Imagery Compare", "Interventions",
+         "Validation", "Machine Learning", "Method and Limits"] + (["Users and Audit"] if auth.can(ROLE, "admin") else [])
+S.setdefault("nav", PAGES[0])
+if S.get("pending_nav"):
+    S.nav = S.pop("pending_nav")
+if S.nav not in PAGES:
+    S.nav = PAGES[0]
+
+
+def goto(p: str):
+    S.nav = p
+
+
+def farms_df(search: str = "") -> pd.DataFrame:
+    df = db.list_farms(conn, search)
+    return df if ALLOWED is None else df[df.farm_pk.isin(ALLOWED)].reset_index(drop=True)
+
+
+def jobs_df() -> pd.DataFrame:
+    df = db.list_jobs(conn, S.farm_pk) if S.farm_pk else db.list_jobs(conn)
+    return df if ALLOWED is None else df[df.farm_pk.isin(ALLOWED)].reset_index(drop=True)
+
+
+if S.farm_pk is not None and ALLOWED is not None and S.farm_pk not in ALLOWED:
+    S.farm_pk = None
+
 st.sidebar.title("🌾 CaneGap Intelligence")
-page = st.sidebar.radio("Section", ["Farm and Field Explorer", "Results and Review", "Interventions", "Validation", "Machine Learning", "Method and Limits"])
+st.sidebar.markdown("**Workflow:** 1 Import and select fields → 2 **Run Analysis** → 3 Results → 4 Review / Validate")
+page = st.sidebar.radio("Section", PAGES, key="nav")
 basemap = st.sidebar.selectbox("Basemap", ["OpenStreetMap", "Esri World Imagery"])
 st.sidebar.caption(f"Algorithm: {ALGO_VERSION}")
+if AUTH:
+    st.sidebar.divider()
+    st.sidebar.caption(f"Signed in as **{user['display_name']}** ({ROLE}{', read-only' if RO else ''})")
+    with st.sidebar.expander("Change my password"):
+        with st.form("chg_pw"):
+            o = st.text_input("Current password", type="password")
+            n = st.text_input("New password", type="password")
+            if st.form_submit_button("Change"):
+                try:
+                    auth.change_password(conn, user["username"], o, n); st.success("Password changed.")
+                except auth.AuthError as e:
+                    st.error(str(e))
+    if st.sidebar.button("Sign out"):
+        auth.audit(conn, user["username"], "logout", "")
+        S.pop("user", None); st.rerun()
+if RO:
+    st.sidebar.info("Read-only account: you can view and export, not change data.")
 
 
-# =========================================================================== explorer
 def import_panel():
     st.subheader("Browse and Import GeoJSON")
     st.caption("Opens your browser's normal file chooser (files on your own computer). "
@@ -72,7 +192,7 @@ def import_panel():
         crs_in = st.text_input("Source CRS (leave blank for WGS84 lon/lat or a CRS declared in the file)",
                                placeholder="e.g. EPSG:32736")
         st.markdown("**Where should it go?**")
-        farms = db.list_farms(conn)
+        farms = farms_df()
         mode = st.radio("Import as", ["New farm(s) from this file", "New version of an existing farm",
                                       "Fields for an existing farm (outline imported earlier)"])
         target = None
@@ -117,6 +237,7 @@ def import_panel():
                                     outline_rows=outline_rows, id_policy=id_policy,
                                     default_farm_name=os.path.splitext(up.name)[0])
             S.vr_name, S.vr_target, S.vr_estate = up.name, target, estate.strip() or None
+            _init_import_state(S.vr)
         except CRSNeedsConfirmation as e:
             S.vr = None
             st.error(str(e))
@@ -137,9 +258,10 @@ def import_panel():
         if s["overlaps"]:
             st.warning(f"{len(s['overlaps'])} overlapping field pair(s) - you will choose an overlap policy "
                        f"before analysis.")
-        show = vr.features.drop(columns=["geometry", "props"])[
-            ["src_index", "is_outline", "field_id", "field_name", "farm_id", "status", "area_ha", "issues"]]
-        st.dataframe(show, width="stretch", hide_index=True)
+        with st.expander("Validation details per feature"):
+            show = vr.features.drop(columns=["geometry", "props"])[
+                ["src_index", "is_outline", "field_id", "field_name", "farm_id", "status", "area_ha", "issues"]]
+            st.dataframe(show, width="stretch", hide_index=True)
         d1, d2 = st.columns(2)
         d1.download_button("Validation report (JSON)", json.dumps(vr.report(), default=str, indent=1),
                            "validation_report.json", "application/json")
@@ -147,18 +269,128 @@ def import_panel():
         if s["rejected"]:
             st.caption("Rejected features are NOT discarded silently: they are listed above with reasons "
                        "and kept in the stored import report.")
-        if vr.usable[~vr.usable.is_outline].empty and not outline_rows:
-            st.error("No usable field geometries - nothing to save.")
-        elif st.button("Save to boundary library"):
-            res = db.save_import(conn, vr, S.vr_name, estate=S.vr_estate, target_farm_pk=S.vr_target)
-            st.success("Saved: " + "; ".join(f"farm {r['farm_id']} version {r['version_no']}" for r in res))
-            S.farm_pk = res[0]["farm_pk"]; S.sel_ids = set(); S.vr = None
+        import_selection(vr, up.name)
+
+
+def _init_import_state(vr):
+    f = vr.features[~vr.features.is_outline]
+    base = attributes.text_frame(f, ["field_id"] + attributes.EDITABLE)
+    S.imp_base, S.imp_attrs = base.copy(), base.copy()
+    S.imp_sel = set(f[f.status != "rejected"].field_id)
+    S.imp_ver = S.get("imp_ver", 0) + 1
+
+
+def import_selection(vr, filename):
+    """After validation: choose which fields to keep/analyse and type in attributes, before anything is saved."""
+    feats = vr.features[~vr.features.is_outline].reset_index(drop=True)
+    outlines = vr.features[vr.features.is_outline]
+    usable = set(feats[feats.status != "rejected"].field_id)
+    if not usable:
+        st.error("No usable field geometries - nothing to save."); return
+    if "imp_attrs" not in S:
+        _init_import_state(vr)
+    st.subheader("Select fields and add attributes")
+    st.caption("Tick the fields you want (or click polygons on the map below). Type **variety**, **planting date** (YYYY-MM-DD), "
+               "ratoon number or last harvest date straight into the table; planting and harvest dates drive the "
+               "recently-harvested / newly-planted rules in the analysis.")
+    info = feats[["field_id", "area_ha", "status", "issues"]]
+    tbl = S.imp_attrs.merge(info, on="field_id", how="left")
+    tbl = tbl[["field_id", "field_name", "area_ha", "status", "variety", "ratoon_number", "planting_date", "last_harvest_date",
+               "crop", "irrigation_system", "issues"]]
+    tbl.insert(0, "select", tbl.field_id.isin(S.imp_sel))
+    edited = st.data_editor(
+        tbl, hide_index=True, width="stretch", key=f"impedit_{S.get('imp_ver', 0)}",
+        disabled=["field_id", "area_ha", "status", "issues"],
+        column_config={"area_ha": st.column_config.NumberColumn("Area (ha)", format="%.2f"),
+                       "planting_date": st.column_config.TextColumn("Planting date", help="YYYY-MM-DD"),
+                       "last_harvest_date": st.column_config.TextColumn("Last harvest", help="YYYY-MM-DD"),
+                       "ratoon_number": st.column_config.TextColumn("Ratoon", help="0 = plant cane")})
+    cur_attrs = attributes.text_frame(edited, ["field_id"] + attributes.EDITABLE)
+    cur_sel = set(edited[edited.select].field_id) & usable
+    n_sel = len(cur_sel)
+    st.markdown(f"**{n_sel} of {len(usable)} usable fields selected - combined area "
+                f"{feats[feats.field_id.isin(cur_sel)].area_ha.sum():,.2f} ha**")
+
+    def commit(sel, attrs):
+        S.imp_sel, S.imp_attrs = set(sel), attrs.reset_index(drop=True)
+        S.imp_ver = S.get("imp_ver", 0) + 1
+        st.rerun()
+
+    b1, b2, b3 = st.columns([1, 1, 5])
+    if b1.button("Select all valid", key="imp_all"):
+        commit(usable, cur_attrs)
+    if b2.button("Clear selection", key="imp_clear"):
+        commit(set(), cur_attrs)
+    with b3.expander("Set the same attributes for all selected fields"):
+        c = st.columns(4)
+        bulk = {"variety": c[0].text_input("Variety", key="bulk_variety"),
+                "planting_date": c[1].text_input("Planting date", key="bulk_plant", placeholder="YYYY-MM-DD"),
+                "last_harvest_date": c[2].text_input("Last harvest date", key="bulk_harv", placeholder="YYYY-MM-DD"),
+                "ratoon_number": c[3].text_input("Ratoon number", key="bulk_ratoon")}
+        bulk = {k: v.strip() for k, v in bulk.items() if v.strip()}
+        if st.button(f"Fill in for the {n_sel} selected field(s)", disabled=not bulk or n_sel == 0):
+            clean, errors, warns = attributes.clean_changes({"all": bulk})
+            if errors:
+                st.error("; ".join(e.replace("all: ", "") for e in errors))
+            else:
+                attrs = cur_attrs.copy()
+                for k, v in clean["all"].items():
+                    attrs.loc[attrs.field_id.isin(cur_sel), k] = v
+                commit(cur_sel, attrs)
+
+    st.caption("Tip: click a polygon to add/remove it.")
+    out = st_folium(selection_map(feats, outlines, cur_sel, basemap), height=380, width=None,
+                    returned_objects=["last_object_clicked"], key=f"impmap_{filename}")
+    click = (out or {}).get("last_object_clicked")
+    if click:
+        sig = ("imp", round(click["lat"], 7), round(click["lng"], 7))
+        if sig != S.get("last_click_sig"):
+            S.last_click_sig = sig
+            hit = field_at_point(feats, click["lat"], click["lng"])
+            if hit and hit in usable:
+                commit(toggle_selection(cur_sel, hit, usable), cur_attrs)
+
+    edits = attributes.changed_rows(S.imp_base, cur_attrs)
+    mode = st.radio("What should be saved to the library?",
+                    ["Import all fields (analyse only the selected ones)", "Import only the selected fields"], horizontal=True)
+    only_sel = mode.startswith("Import only")
+    if only_sel and n_sel == 0:
+        st.warning("Select at least one field.")
+    if edits:
+        st.caption(f"{sum(len(v) for v in edits.values())} manual attribute value(s) in {len(edits)} field(s) will be saved "
+                   f"with the import (and recorded in the attribute history).")
+    b1, b2 = st.columns([1, 1])
+    save = b1.button("Save to boundary library", disabled=RO or (only_sel and n_sel == 0))
+    save_run = b2.button("Save and run analysis on the selected fields →", type="primary", disabled=RO or n_sel == 0)
+    if save or save_run:
+        clean, errors, warns = attributes.clean_changes({k: v for k, v in edits.items() if (not only_sel or k in cur_sel)})
+        if errors:
+            st.error("Fix these attribute values first: " + "; ".join(errors)); return
+        vr2 = subset_validation(vr, cur_sel) if only_sel else vr
+        res = db.save_import(conn, vr2, S.vr_name, estate=S.vr_estate, target_farm_pk=S.vr_target)
+        n_changed = 0
+        for r in res:
+            have = set(db.get_fields(conn, r["version_pk"]).field_id)
+            ch = {f: v for f, v in clean.items() if f in have and v}
+            if ch:
+                n_changed += db.update_field_attributes(conn, r["version_pk"], ch, user["username"], "manual (at import)")["changed"]
+        msg = "; ".join(f"farm {r['farm_id']} version {r['version_no']}" for r in res)
+        log("import_saved", f"{S.vr_name}: {msg}; fields selected {n_sel}; manual attribute values {n_changed}")
+        S.flash = f"Saved: {msg}. {n_sel} field(s) selected for analysis" + (f"; {n_changed} attribute value(s) added" if n_changed else "")
+        S.farm_pk = res[0]["farm_pk"]
+        S.sel_ids = set(cur_sel)
+        S.vr = None
+        for k in ("imp_attrs", "imp_base", "imp_sel"):
+            S.pop(k, None)
+        if save_run:
+            S.pending_nav = "Run Analysis"
+        st.rerun()
 
 
 def library_panel():
     st.subheader("Saved boundary library")
     q = st.text_input("Search farms (name, ID, estate, date)", key="farm_search")
-    farms = db.list_farms(conn, q)
+    farms = farms_df(q)
     if farms.empty:
         st.info("No saved farms yet. Import a GeoJSON on the 'Import' tab, or the sample in sample_data/.")
         return None
@@ -172,8 +404,8 @@ def library_panel():
     farm_pk = S.farm_pk
     with st.expander("Rename farm, versions and import history"):
         new = st.text_input("Rename farm", value=farms[farms.farm_pk == farm_pk].iloc[0].farm_name)
-        if st.button("Save name"):
-            db.rename_farm(conn, farm_pk, new); st.rerun()
+        if st.button("Save name", disabled=RO):
+            db.rename_farm(conn, farm_pk, new); log("farm_renamed", f"{farm_pk} -> {new}"); st.rerun()
         vers = db.list_versions(conn, farm_pk)
         st.dataframe(vers, width="stretch", hide_index=True)
         if len(vers) > 1:
@@ -185,7 +417,59 @@ def library_panel():
     return farm_pk
 
 
-def select_and_run(farm_pk: int):
+def attribute_panel(vpk: int, fields, sel_ids: set, key: str):
+    """Edit variety, planting date, last harvest date, ratoon, crop, irrigation system for existing fields. Saved to the
+    database with validation and a change history; the next analysis job freezes the values it uses."""
+    scope = st.radio("Fields to show", ["Selected fields", "All fields"], horizontal=True, key=f"scope_{key}",
+                     index=0 if sel_ids else 1)
+    view = fields[fields.field_id.isin(sel_ids)] if scope == "Selected fields" else fields
+    view = view[view.status != "rejected"]
+    if view.empty:
+        st.info("No fields to show - select some fields first."); return
+    cols = ["field_id", "field_name"] + [c for c in attributes.EDITABLE if c != "field_name"]
+    before = attributes.text_frame(view, cols)
+    ver = S.get(f"attrver_{key}", 0)
+    edited = st.data_editor(
+        before, hide_index=True, width="stretch", key=f"attr_{key}_{vpk}_{ver}_{scope}", disabled=["field_id"],
+        column_config={"planting_date": st.column_config.TextColumn("Planting date", help="YYYY-MM-DD"),
+                       "last_harvest_date": st.column_config.TextColumn("Last harvest", help="YYYY-MM-DD"),
+                       "ratoon_number": st.column_config.TextColumn("Ratoon", help="0 = plant cane")})
+    changes = attributes.changed_rows(before, edited)
+    c1, c2 = st.columns([1, 3])
+    if c1.button(f"Save table edits ({sum(len(v) for v in changes.values())})", key=f"saveattr_{key}", disabled=RO or not changes,
+                 type="primary"):
+        try:
+            r = db.update_field_attributes(conn, vpk, changes, user["username"], "manual")
+            log("attributes_edited", f"version {vpk}: {r['changed']} values in {r['fields']} fields")
+            for w in r["warnings"]:
+                st.warning(w)
+            S[f"attrver_{key}"] = ver + 1
+            st.success(f"Saved {r['changed']} value(s) in {r['fields']} field(s).")
+            if not r["warnings"]:
+                st.rerun()
+        except attributes.AttributeError_ as e:
+            st.error(str(e))
+    with st.expander(f"Set the same value for all {len(view)} field(s) shown"):
+        c = st.columns(4)
+        bulk = {"variety": c[0].text_input("Variety", key=f"bv_{key}"),
+                "planting_date": c[1].text_input("Planting date", key=f"bp_{key}", placeholder="YYYY-MM-DD"),
+                "last_harvest_date": c[2].text_input("Last harvest date", key=f"bh_{key}", placeholder="YYYY-MM-DD"),
+                "ratoon_number": c[3].text_input("Ratoon number", key=f"br_{key}")}
+        bulk = {k: v.strip() for k, v in bulk.items() if v.strip()}
+        if st.button("Apply to all shown fields", key=f"applyattr_{key}", disabled=RO or not bulk):
+            try:
+                r = db.update_field_attributes(conn, vpk, {f: dict(bulk) for f in view.field_id}, user["username"], "manual (bulk)")
+                log("attributes_bulk", f"version {vpk}: {r['changed']} values")
+                S[f"attrver_{key}"] = ver + 1
+                st.rerun()
+            except attributes.AttributeError_ as e:
+                st.error(str(e))
+    with st.expander("Attribute change history"):
+        st.dataframe(db.attribute_history(conn, vpk), hide_index=True, width="stretch")
+    st.caption("Geometry is never changed here. Attributes are recorded with every analysis job, so past results stay traceable.")
+
+
+def field_selection(farm_pk: int):
     vpk = db.current_version(conn, farm_pk)
     fields = db.get_fields(conn, vpk)
     outlines = db.get_fields(conn, vpk, include_outlines=True)
@@ -219,21 +503,59 @@ def select_and_run(farm_pk: int):
     S.sel_ids -= rejected
     sel = fields[fields.field_id.isin(S.sel_ids)]
     st.markdown(f"**{len(sel)} of {len(fields)} fields selected - combined area {sel.area_ha.sum():,.2f} ha**")
-    st_folium(selection_map(fields, outlines, set(S.sel_ids), basemap), height=430, width=None,
-              returned_objects=[], key=f"selmap_{farm_pk}_{len(S.sel_ids)}")
+    st.caption("Tip: click a field polygon on the map to add/remove it from the selection.")
+    out = st_folium(selection_map(fields, outlines, set(S.sel_ids), basemap), height=430, width=None,
+                    returned_objects=["last_object_clicked"], key=f"selmap_{farm_pk}")
+    click = (out or {}).get("last_object_clicked")
+    if click:
+        sig = (round(click["lat"], 7), round(click["lng"], 7))
+        if sig != S.get("last_click_sig"):
+            S.last_click_sig = sig
+            fid_clicked = field_at_point(fields, click["lat"], click["lng"])
+            if fid_clicked:
+                S.sel_ids = toggle_selection(S.sel_ids, fid_clicked, set(fields[fields.status != "rejected"].field_id))
+                S.editor_ver = S.get("editor_ver", 0) + 1
+                st.rerun()
 
-    with st.expander("Edit field metadata"):
-        fid = st.selectbox("Field", fields.field_id.tolist(), key="meta_field")
-        r = fields[fields.field_id == fid].iloc[0]
-        vals = {k: st.text_input(k, value=r[k] or "", key=f"meta_{k}_{fid}")
-                for k in ["field_name", "crop", "variety", "ratoon_number", "last_harvest_date", "planting_date",
-                          "irrigation_system"]}
-        if st.button("Save metadata"):
-            db.update_field_metadata(conn, int(r.row_pk), **{k: (v or None) for k, v in vals.items()})
-            st.success("Saved."); st.rerun()
+    with st.expander("Field attributes: variety, planting date, last harvest, ratoon (add / edit manually)"):
+        attribute_panel(vpk, fields, set(S.sel_ids), "lib")
 
-    # ---------------------------------------------------------------- run analysis
     st.divider()
+    st.button("Next: run analysis on the selected fields →", on_click=goto, args=("Run Analysis",), type="primary",
+              disabled=len(sel) == 0)
+
+
+def run_panel():
+    st.title("Run Analysis")
+    farms = farms_df()
+    if farms.empty:
+        st.info("Import a farm boundary first (Farm and Field Explorer)."); return
+    label = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in farms.itertuples()}
+    keys = list(label)
+    cur = next((i for i, k in enumerate(keys) if label[k] == S.farm_pk), 0)
+    farm_pk = label[st.selectbox("Farm", keys, index=cur)]
+    if farm_pk != S.farm_pk:
+        S.farm_pk = farm_pk; S.sel_ids = set()
+    vpk = db.current_version(conn, farm_pk)
+    fields = db.get_fields(conn, vpk)
+    ids_all = fields[fields.status != "rejected"].field_id.tolist()
+    skey = f"runsel_{farm_pk}"
+    if S.get("entered_run") or skey not in S:
+        S[skey] = [i for i in ids_all if i in S.sel_ids]
+    c1, c2 = st.columns([5, 1])
+    def _all(): S[skey] = list(ids_all)
+    c2.button("Select all", on_click=_all)
+    S.sel_ids = set(c1.multiselect("Fields to analyse (each is processed independently)", ids_all, key=skey))
+    sel = fields[fields.field_id.isin(S.sel_ids)]
+    st.markdown(f"**{len(sel)} of {len(ids_all)} fields selected - combined area {sel.area_ha.sum():,.2f} ha**")
+    st.caption("You can also select fields by clicking polygons on the map in the Farm and Field Explorer.")
+    no_dates = sel[sel.planting_date.isna() & sel.last_harvest_date.isna()] if len(sel) else sel
+    if len(no_dates):
+        st.warning(f"{len(no_dates)} selected field(s) have no planting or last-harvest date, so the recent-harvest / "
+                   f"new-planting rules cannot be applied: {', '.join(no_dates.field_id.head(8))}{' ...' if len(no_dates) > 8 else ''}. "
+                   f"Add dates below if you know them.")
+    with st.expander("Field attributes used by this analysis (variety, planting date, ...)", expanded=bool(len(no_dates))):
+        attribute_panel(vpk, fields, set(S.sel_ids), "run")
     st.subheader("Run Gap Analysis")
     report = json.loads(conn.execute("SELECT report_json FROM boundary_versions WHERE id=?", (vpk,)).fetchone()[0])
     overlaps = report["summary"].get("overlaps", [])
@@ -293,35 +615,101 @@ def select_and_run(farm_pk: int):
         p.min_valid_fraction = st.slider("Minimum valid-observation fraction", 0.1, 1.0, p.min_valid_fraction, 0.05)
         p.harvest_window_days = st.number_input("Recent-harvest window (days)", 0, 365, p.harvest_window_days)
         p.planting_window_days = st.number_input("New-planting window (days)", 0, 365, p.planting_window_days)
-    if st.button("Run Gap Analysis", type="primary", disabled=not can_run):
-        bar = st.progress(0.0, text="Starting...")
-        def cb(i, n, fid):
-            bar.progress(i / max(n, 1), text=f"Analysing field {fid} ({i}/{n})")
+    if RO:
+        st.info("Your account is read-only; ask an analyst or administrator to run analyses.")
+    bg = st.toggle("Run in the background (the app stays usable; progress shown below)", value=True)
+    if st.button("Run Gap Analysis", type="primary", disabled=(not can_run) or RO):
         try:
-            job = run_analysis(conn, farm_pk, vpk, sorted(S.sel_ids), prov, d_from, d_to, p, policy, cb, model=bundle)
+            job = queue_analysis(conn, farm_pk, vpk, sorted(S.sel_ids), prov, d_from, d_to, p, policy, bundle,
+                                 user["username"])
+            log("job_queued", f"job {job} farm {farm_pk} fields {len(S.sel_ids)} source {prov.name} "
+                              f"method {bundle.label if bundle else 'threshold'}")
             S.job_id = job
-            bar.progress(1.0, text="Done")
-            st.success(f"Job {job} completed. Open 'Results and Review' in the sidebar.")
+            if bg:
+                get_runner().submit(job, prov, bundle)
+                S.watch_job = job
+            else:
+                bar = st.progress(0.0, text="Starting...")
+                def cb(i, n, fid):
+                    bar.progress(i / max(n, 1), text=f"Analysing field {fid} ({i}/{n})")
+                execute_job(conn, job, prov, bundle, cb)
+                bar.progress(1.0, text="Done")
+                S.run_done = job
+        except DuplicateJob as e:
+            st.warning(str(e) + " Wait for it to finish or cancel it below.")
         except Exception as e:  # noqa: BLE001
             st.error(f"Analysis failed: {e}")
+    if S.get("run_done"):
+        st.success(f"Job {S.run_done} completed.")
+        st.button("Open results →", on_click=goto, args=("Results and Review",), type="primary")
+    st.subheader("Jobs")
+    (monitor_live if _active_jobs_exist() else monitor_static)()
+
+
+def _active_jobs_exist() -> bool:
+    df = jobs_df()
+    return bool(len(df) and df.status.isin(["queued", "running"]).any())
+
+
+def _monitor_body():
+    df = jobs_df()
+    if df.empty:
+        st.caption("No jobs yet."); return
+    active = df[df.status.isin(["queued", "running"])]
+    for r in active.itertuples():
+        total = max(int(r.progress_total or 0), 1)
+        c1, c2 = st.columns([6, 1])
+        c1.progress(min(int(r.progress_done or 0) / total, 1.0),
+                    text=f"Job {r.id} - {r.status} - {('field ' + str(r.current_field)) if r.current_field else 'waiting'} "
+                         f"({int(r.progress_done or 0)}/{total}) - started by {r.created_by or 'n/a'}")
+        mine = auth.can(ROLE, "admin") or (r.created_by in (None, user["username"]))
+        if c2.button("Cancel", key=f"cancel_{r.id}", disabled=RO or not mine):
+            db.request_cancel(conn, int(r.id))
+            log("job_cancel_requested", str(r.id))
+    watch = S.get("watch_job")
+    if watch:
+        j = db.get_job(conn, int(watch))
+        if j and j["status"] == "completed":
+            st.success(f"Job {watch} completed.")
+            if st.button("Open results →", key="open_res_bg", type="primary"):
+                S.nav = "Results and Review"; S.job_id = int(watch); S.watch_job = None
+                st.rerun(scope="app")
+        elif j and j["status"] in ("failed", "cancelled", "interrupted"):
+            st.warning(f"Job {watch} {j['status']}: {j['error'] or ''}")
+    recent = df[~df.status.isin(["queued", "running"])].head(6)
+    if len(recent):
+        st.dataframe(recent[["id", "status", "source", "algo_version", "date_to", "progress_done", "progress_total", "created_by",
+                             "created_at", "error"]], hide_index=True, width="stretch")
+
+
+monitor_live = st.fragment(run_every="2s")(_monitor_body)
+monitor_static = st.fragment(_monitor_body)
 
 
 def explorer():
     st.title("Farm and Field Explorer")
-    t1, t2 = st.tabs(["Import", "Library, selection and analysis"])
+    st.caption("1. Import a boundary (Import tab) → 2. Choose a farm and select fields (second tab) → 3. press **Run Analysis** "
+               "(sidebar or the button under the field table).")
+    if S.get("flash"):
+        st.success(S.flash + " - boundary saved. Next, pick the fields to analyse.")
+        c1, c2 = st.columns([1, 5])
+        c1.button("Select fields and run analysis →", on_click=goto, args=("Run Analysis",), type="primary")
+        if c2.button("Dismiss"):
+            S.flash = None; st.rerun()
+    t1, t2 = st.tabs(["Import", "Library and field selection"])
     with t1:
         import_panel()
     with t2:
         farm_pk = library_panel()
         if farm_pk:
             st.divider()
-            select_and_run(farm_pk)
+            field_selection(farm_pk)
 
 
 # =========================================================================== results
 def results():
     st.title("Results and Review")
-    jobs = db.list_jobs(conn, S.farm_pk) if S.farm_pk else db.list_jobs(conn)
+    jobs = jobs_df()
     if jobs.empty:
         st.info("No analysis jobs yet. Run one from the Explorer.")
         return
@@ -334,7 +722,10 @@ def results():
     if synthetic:
         st.error("SYNTHETIC DEMO DATA - these are NOT satellite observations or real results.", icon="🧪")
     banner_unvalidated()
-    if job.status != "completed":
+    if job.status in ("queued", "running"):
+        st.info(f"Job {job_pk} is {job.status}: {int(job.progress_done or 0)} of {int(job.progress_total or 0)} fields done "
+                f"(showing results so far). Reload this page to refresh.")
+    elif job.status != "completed":
         st.error(f"Job status: {job.status}. {job.error or ''}")
     res = db.job_results(conn, job_pk)
     gaps = db.job_gaps(conn, job_pk)
@@ -371,10 +762,25 @@ def results():
                                 "analysed_area_ha": st.column_config.NumberColumn("Analysed (ha)", format="%.2f"),
                                 "valid_fraction": st.column_config.ProgressColumn("Valid obs.", min_value=0, max_value=1)})
 
-    focus = st.selectbox("Map focus", ["All fields"] + res.field_id.tolist())
+    opts = ["All fields"] + res.field_id.tolist()
+    if S.get("pending_focus") in opts:
+        S.res_focus = S.pending_focus
+    S.pending_focus = None
+    if S.get("res_focus") not in opts:
+        S.res_focus = "All fields"
+    focus = st.selectbox("Map focus (or click a field on the map)", opts, key="res_focus")
     fid = None if focus == "All fields" else focus
-    st_folium(results_map(fields, res, gaps, basemap, fid), height=500, width=None, returned_objects=[],
-              key=f"resmap_{job_pk}_{focus}_{len(gaps)}")
+    rmap = st_folium(results_map(fields, res, gaps, basemap, fid), height=500, width=None,
+                     returned_objects=["last_object_clicked"], key=f"resmap_{job_pk}_{focus}_{len(gaps)}")
+    click = (rmap or {}).get("last_object_clicked")
+    if click:
+        sig = ("res", job_pk, round(click["lat"], 7), round(click["lng"], 7))
+        if sig != S.get("last_click_sig"):
+            S.last_click_sig = sig
+            hit = field_at_point(fields, click["lat"], click["lng"])
+            if hit and hit in opts and hit != focus:
+                S.pending_focus = hit
+                st.rerun()
     st.caption("Layers: field outlines (green <2% / amber 2-5% / red >5% gap; grey = insufficient evidence; "
                "blue = harvested/new planting) and red candidate-gap polygons (model predictions, unverified).")
 
@@ -402,11 +808,11 @@ def results():
                                                             help="Not a measured accuracy."),
                 "area_ha": st.column_config.NumberColumn("Predicted area (ha)", format="%.4f")})
         c1, c2 = st.columns([1, 1])
-        if c1.button("Save review edits"):
-            db.update_gaps(conn, out); st.success("Saved."); st.rerun()
+        if c1.button("Save review edits", disabled=RO):
+            db.update_gaps(conn, out); log("gaps_reviewed", f"job {job_pk} n={len(out)}"); st.success("Saved."); st.rerun()
         del_id = c2.selectbox("Delete a false-positive polygon", [None] + g.gap_id.tolist())
-        if del_id and c2.button("Delete polygon"):
-            db.delete_gap(conn, int(del_id)); st.rerun()
+        if del_id and c2.button("Delete polygon", disabled=RO):
+            db.delete_gap(conn, int(del_id)); log("gap_deleted", f"gap {del_id} job {job_pk}"); st.rerun()
         st.caption("Predicted, field-verified, proposed and treated areas are kept as separate fields. "
                    "Deleting removes the polygon from totals shown on re-run exports; the job's stored "
                    "field totals still reflect the original prediction.")
@@ -430,6 +836,19 @@ def results():
         S.pdf_cache[(job_pk, fid)] = reports.field_report(conn, job_pk, fid)
     if fid and (job_pk, fid) in S.pdf_cache:
         p2.download_button(f"Download field PDF ({fid})", S.pdf_cache[(job_pk, fid)], f"{fn}_{fid}_report.pdf", "application/pdf")
+    r1, r2, _ = st.columns([1, 1, 4])
+    if r1.button("Build classified GeoTIFF (all fields)"):
+        S.pdf_cache[(job_pk, "tif")] = rasters.gaps_to_geotiff(fields, res, gaps, tags={"JOB": str(job_pk), "SOURCE": str(job.source),
+                                                                                       "SYNTHETIC": "yes" if synthetic else "no"})
+        log("export_geotiff", f"job {job_pk}")
+    if (job_pk, "tif") in S.pdf_cache:
+        r1.download_button("Download classified GeoTIFF", S.pdf_cache[(job_pk, "tif")], f"{fn}_classified.tif", "image/tiff")
+    if fid and r2.button(f"Build GeoTIFF ({fid})"):
+        S.pdf_cache[(job_pk, "tif" + fid)] = rasters.gaps_to_geotiff(fields, res, gaps, field_ids=[fid], tags={"JOB": str(job_pk)})
+    if fid and (job_pk, "tif" + fid) in S.pdf_cache:
+        r2.download_button(f"Download GeoTIFF ({fid})", S.pdf_cache[(job_pk, "tif" + fid)], f"{fn}_{fid}_classified.tif", "image/tiff")
+    st.caption("Classified GeoTIFF is rasterised from the current (reviewed) gap polygons at 10 m: 0 no gap, 1 candidate gap, "
+               "2 possible waterlogging, 3 field not assessed, 255 outside analysed fields.")
     e5.download_button("Fields CSV", exports.to_csv(res), f"{fn}_fields.csv", "text/csv")
     notes = ["CaneGap Intelligence export", f"Job {job_pk}; algorithm {job.algo_version}; boundary version id {job.version_pk}",
              "UNVALIDATED SCREENING OUTPUT - candidate gaps require field verification.",
@@ -470,8 +889,8 @@ def interventions_page():
     st.title("Intervention management")
     st.caption("Plan follow-up for candidate gaps. When the cause is unknown the default action is field verification. "
                "Proposed, estimated and actual values are stored separately.")
-    jobs = db.list_jobs(conn, S.farm_pk) if S.farm_pk else db.list_jobs(conn)
-    farms = db.list_farms(conn)
+    jobs = jobs_df()
+    farms = farms_df()
     if farms.empty:
         st.info("Import a farm first."); return
     flabel = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in farms.itertuples()}
@@ -511,8 +930,9 @@ def interventions_page():
             min_c = c2.slider("Minimum heuristic score", 0.0, 1.0, 0.0, 0.05)
             who = c3.text_input("Assign to (team/supervisor)")
             tgt = c4.date_input("Target completion", date.today() + timedelta(days=14))
-            if st.button("Create worklist from candidate gaps", type="primary"):
+            if st.button("Create worklist from candidate gaps", type="primary", disabled=RO):
                 n, sk = iv.worklist_from_gaps(conn, jp, min_a, min_c, who or None, tgt)
+                log("worklist_created", f"job {jp} n={n}")
                 st.success(f"Created {n} intervention(s); {len(sk)} skipped (already open or invalid).")
             st.caption("Priority is a configurable inspection-ranking heuristic (area and score), not a diagnosis.")
 
@@ -533,13 +953,14 @@ def interventions_page():
             tgt = c3.date_input("Target completion", date.today() + timedelta(days=14), key="nt")
             prop = st.number_input("Proposed treatment area (ha)", 0.0, 1000.0, 0.0, 0.01)
             notes = st.text_area("Notes")
-            if st.form_submit_button("Create"):
+            if st.form_submit_button("Create", disabled=RO):
                 try:
                     jp = jobs[jobs.farm_pk == farm_pk].iloc[0].id if len(jobs) else None
                     db.create_intervention(conn, farm_pk=farm_pk, farm_id=farm["farm_id"], field_id=fid, action=action,
                                            priority=pri, gap_id=gid, job_pk=None if jp is None else int(jp), version_pk=vpk,
                                            assigned_to=who or None, target_date=tgt, proposed_area_ha=prop or None,
                                            notes=notes or None)
+                    log("intervention_created", f"{fid} {action}")
                     st.success("Created.")
                 except ValueError as e:
                     st.error(str(e))
@@ -560,16 +981,17 @@ def interventions_page():
                 tdate = c2.text_input("Treatment date (YYYY-MM-DD)", value=r.treatment_date or "")
                 cost = c3.number_input("Actual cost", 0.0, 1e9, float(r.actual_cost or 0.0), 1.0)
                 notes = st.text_area("Notes", value=r.notes or "")
-                if st.form_submit_button("Save changes"):
+                if st.form_submit_button("Save changes", disabled=RO):
                     try:
                         db.update_intervention(conn, int(iid), status=status, priority=pri, assigned_to=who or None,
                                                verified_cause=cause or None, actual_area_ha=act_area if (act_area or status == "Completed") else None,
                                                treatment_date=tdate or None, actual_cost=cost or None, notes=notes or None)
+                        log("intervention_updated", f"#{iid} -> {status}")
                         st.success("Saved."); st.rerun()
                     except ValueError as e:
                         st.error(str(e))
-            if st.button("Delete this intervention"):
-                db.delete_intervention(conn, int(iid)); st.rerun()
+            if st.button("Delete this intervention", disabled=RO):
+                db.delete_intervention(conn, int(iid)); log("intervention_deleted", str(iid)); st.rerun()
 
     with t4:
         st.markdown("Enter your own rates; nothing is assumed. Estimates are never mixed with recorded actuals.")
@@ -591,7 +1013,7 @@ def ml_page():
     st.warning("Models learn from **field-verified polygons you supply**. Scores from few fields are anecdotal; a model is "
                "only as good as, and only valid for, the seasons/farms it was trained and tested on. Probabilities are "
                "not accuracy.", icon="⚠️")
-    farms = db.list_farms(conn)
+    farms = farms_df()
     if farms.empty:
         st.info("Import a farm first."); return
     flabel = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in farms.itertuples()}
@@ -614,7 +1036,7 @@ def ml_page():
         if prov is not None and prov.synthetic:
             st.info("Synthetic mode: you can generate SYNTHETIC reference surveys from the generator to test the workflow. "
                     "Results say nothing about real performance.")
-            if st.button("Generate SYNTHETIC reference surveys for all fields"):
+            if st.button("Generate SYNTHETIC reference surveys for all fields", disabled=RO):
                 for r in fields.itertuples():
                     db.add_survey(conn, farm_pk, vpk, r.field_id, date.today(), "SYNTHETIC", "SYNTHETIC truth (demo)", True,
                                   "generated by demo provider", prov.truth_polygons(r.geometry, r.field_id))
@@ -628,7 +1050,7 @@ def ml_page():
         per_class = c[0].number_input("Max samples per class per field", 100, 20000, 3000, 100)
         folds = c[1].number_input("CV folds", 2, 10, 5)
         grp = c[2].selectbox("Hold out whole", ["field_id", "farm_id"])
-        if st.button("Build training set and compare feature sets", type="primary", disabled=prov is None):
+        if st.button("Build training set and compare feature sets", type="primary", disabled=(prov is None) or RO):
             with st.spinner("Fetching imagery per surveyed field and sampling pixels..."):
                 df, summ = ml.build_training_set(conn, prov, vpk, d_from, d_to, use_change, ignore_band_m=ignore, max_per_class=int(per_class))
             S.ml = {"df": df, "summ": summ, "farm_pk": farm_pk, "synthetic": prov.synthetic, "use_change": use_change,
@@ -658,17 +1080,20 @@ def ml_page():
         leaf = c[2].number_input("Min samples per leaf", 1, 100, 5)
         thr = c[3].slider("Probability threshold", 0.1, 0.9, 0.5, 0.05,
                           help="Choose before looking at test scores; tuning it on the evaluation fields inflates them.")
+        calib = st.selectbox("Probability calibration", ["none", "sigmoid", "isotonic"],
+                             help="Fitted on out-of-fold (field-held-out) predictions and checked by cross-fitting; needs >= 3 surveyed fields.")
         name = st.text_input("Model name", f"RF {fset} {date.today()}")
         if fset != "s2" and "VH_db" not in m["df"].columns:
             st.error("Training set has no Sentinel-1 features."); return
-        if st.button("Train and register model", type="primary"):
+        if st.button("Train and register model", type="primary", disabled=RO):
             try:
                 with st.spinner("Training..."):
                     rfp = ml.default_rf_params(n_estimators=int(trees), min_samples_leaf=int(leaf))
-                    b = ml.train_model(m["df"], fset, m["use_change"], rfp, thr, m["synthetic"], n_splits=m["folds"], group_col=m["grp"],
+                    b = ml.train_model(m["df"], fset, m["use_change"], rfp, thr, m["synthetic"], n_splits=m["folds"], group_col=m["grp"], calibration=calib,
                                        provenance={"source": m["source"], "dates": m["dates"], "boundary_version": vpk,
                                                    "training_fields": sorted(m["df"].field_id.unique().tolist())})
                     mid = ml.register_model(conn, b, name, db.data_dir() / "models")
+                    log("model_trained", f"#{mid} {fset} fields={b.meta['n_fields']} cv={bool(b.meta['cv'])}")
                 st.success(f"Registered model #{mid}.")
                 if b.meta["cv"]:
                     r = b.meta["cv"]["rf"]
@@ -676,6 +1101,16 @@ def ml_page():
                              f"AUC {r['auc']:.2f} over {b.meta['cv']['n_groups']} groups.")
                 else:
                     st.warning("Not cross-validated: " + b.meta["cv_note"])
+                cal = b.meta.get("calibration")
+                if cal:
+                    st.markdown(f"**Calibration ({cal['method']}, cross-fitted)**: Brier {cal['brier_raw']:.3f} → {cal['brier_calibrated_crossfit']:.3f}; "
+                                f"expected calibration error {cal['ece_raw']:.3f} → {cal['ece_calibrated_crossfit']:.3f}")
+                    rel = pd.DataFrame(cal["reliability_raw"]).set_index("mean_pred")[["observed"]].rename(columns={"observed": "raw"})
+                    rel2 = pd.DataFrame(cal["reliability_calibrated"]).set_index("mean_pred")[["observed"]].rename(columns={"observed": "calibrated"})
+                    st.line_chart(pd.concat([rel, rel2]).sort_index(), x_label="mean predicted probability", y_label="observed gap fraction")
+                    st.caption(cal["note"] + " Perfect calibration lies on the diagonal.")
+                elif b.meta.get("calibration_note"):
+                    st.info(b.meta["calibration_note"])
                 st.bar_chart(pd.Series(b.meta["importances"], name="importance"))
                 st.caption("Impurity importances are indicative only and favour correlated/continuous features.")
             except ml.InsufficientData as e:
@@ -688,14 +1123,252 @@ def ml_page():
         st.dataframe(mdf, hide_index=True, width="stretch")
         mid = st.selectbox("Inspect model", mdf.id.tolist())
         row = db.get_model_row(conn, int(mid))
+        if row["calibration_json"] and row["calibration_json"] != "null":
+            cj = json.loads(row["calibration_json"])
+            st.caption(f"Calibrated ({cj['method']}): Brier {cj['brier_raw']:.3f} → {cj['brier_calibrated_crossfit']:.3f} (cross-fitted)")
         st.json({"features": json.loads(row["features_json"]), "provenance": json.loads(row["provenance_json"] or "{}"),
                  "rf_params": json.loads(row["rf_params_json"] or "{}"), "sklearn": row["sklearn_version"],
                  "cv_note": row["cv_note"], "cv": json.loads(row["cv_json"]) if row["cv_json"] and row["cv_json"] != "null" else None},
                 expanded=False)
         st.caption("Model files are pickles: only load files created by this app. Applying a model to a different season, region or "
                    "sensor geometry requires new validation.")
-        if st.button("Delete this model"):
-            db.delete_model(conn, int(mid)); st.rerun()
+        if st.button("Delete this model", disabled=not auth.can(ROLE, "admin")):
+            db.delete_model(conn, int(mid)); log("model_deleted", str(mid)); st.rerun()
+
+
+def run_page():
+    if S.get("entered_run"):
+        S.run_done = None
+    run_panel()
+
+
+# =========================================================================== dashboards
+def dashboards_page():
+    st.title("Estate, farm and field dashboards")
+    farms = farms_df()
+    if farms.empty:
+        st.info("Import a farm and run an analysis first."); return
+    inc = st.checkbox("Include synthetic demo jobs", value=False,
+                      help="Synthetic jobs are excluded by default so demo output is never rolled into real totals.")
+    jobs = dsh.latest_jobs(conn, farms.farm_pk.tolist(), inc)
+    if jobs.empty:
+        st.info("No completed analysis jobs to show" + ("." if inc else " (synthetic demo jobs are hidden - tick the box above to see them)."))
+        return
+    ft = dsh.farm_table(conn, jobs.job_pk.tolist())
+    et = dsh.estate_table(ft)
+    banner_unvalidated()
+    if ft.synthetic.any():
+        st.error("Some figures come from SYNTHETIC demo data.", icon="🧪")
+    t1, t2 = st.tabs(["Estates and drill-down", "Trends"])
+    with t1:
+        a, b, c, d = st.columns(4)
+        a.metric("Estates", len(et)); b.metric("Farms", int(et.n_farms.sum())); c.metric("Candidate gap (ha)", f"{et.candidate_gap_ha.sum():,.2f}")
+        tot_area = et.analysed_area_ha.sum()
+        d.metric("Gap % (area-weighted)", f"{100 * et.candidate_gap_ha.sum() / tot_area:.2f}%" if tot_area else "n/a")
+        st.dataframe(et, hide_index=True, width="stretch")
+        if et.mixed_assessment_dates.any():
+            st.warning("Farms in some estates were assessed on different dates; totals combine each farm's latest job and are not a single-date snapshot.")
+        st.bar_chart(et.set_index("estate")[["candidate_gap_ha"]], y_label="candidate gap (ha)")
+        st.subheader("Drill down: estate → farm → field → gap polygon")
+        est = st.selectbox("Estate", et.estate.tolist())
+        fsub = ft[ft.estate == est]
+        st.dataframe(fsub.drop(columns=["estate", "farm_pk"]), hide_index=True, width="stretch")
+        farm_lab = {f"{r.farm_name} ({r.farm_id})": r for r in fsub.itertuples()}
+        fchoice = farm_lab[st.selectbox("Farm", list(farm_lab))]
+        ftab = dsh.field_table(conn, int(fchoice.job_pk))
+        st.dataframe(ftab.sort_values("gap_area_ha", ascending=False), hide_index=True, width="stretch",
+                     column_config={"gap_pct": st.column_config.NumberColumn("Gap %", format="%.2f"),
+                                    "gap_area_ha": st.column_config.NumberColumn("Gap (ha)", format="%.3f")})
+        fid = st.selectbox("Field", ftab.field_id.tolist())
+        gaps = db.job_gaps(conn, int(fchoice.job_pk))
+        g = gaps[gaps.field_id == fid]
+        st.dataframe(g.drop(columns=["geometry"]).sort_values("area_ha", ascending=False)[
+            ["gap_id", "area_ha", "pct_of_field", "category", "confidence", "change_status", "verification_status"]],
+            hide_index=True, width="stretch")
+        res = db.job_results(conn, int(fchoice.job_pk))
+        flds = db.get_fields(conn, int(jobs[jobs.job_pk == fchoice.job_pk].iloc[0].version_pk))
+        st_folium(results_map(flds, res, gaps, basemap, fid), height=380, width=None, returned_objects=[],
+                  key=f"dashmap_{fchoice.job_pk}_{fid}")
+        def _open(job_pk=int(fchoice.job_pk), f=fid):
+            S.job_id = job_pk; S.pending_focus = f; S.nav = "Results and Review"
+        st.button("Open this field in Results and Review →", on_click=_open)
+    with t2:
+        farm_lab2 = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in farms.itertuples()}
+        fp = farm_lab2[st.selectbox("Farm", list(farm_lab2), key="trend_farm")]
+        tr = dsh.trend(conn, fp, include_synthetic=inc)
+        if tr.empty:
+            st.info("No completed jobs for this farm.")
+        else:
+            st.dataframe(tr, hide_index=True, width="stretch")
+            if len(tr) > 1:
+                st.line_chart(tr.set_index("assessment_date")[["gap_pct"]], y_label="farm gap %")
+                bad = tr[(~tr.comparable_with_previous) & (tr.index > 0)]
+                if len(bad):
+                    st.warning("Some points are not like-for-like with the previous assessment (see comparability_flags): "
+                               "changes there may reflect method, boundary, parameters or coverage rather than the crop.")
+            else:
+                st.caption("Run more assessments (different dates) to see a trend.")
+        st.subheader("Estate trend")
+        ests = sorted(ft.estate.unique())
+        e = st.selectbox("Estate", ests, key="trend_estate")
+        pks = [int(x) for x in ft[ft.estate == e].farm_pk.unique()]
+        et2 = dsh.estate_trend(conn, pks)
+        if not et2.empty:
+            st.dataframe(et2, hide_index=True, width="stretch")
+            if et2.carried_forward.any():
+                st.caption("carried_forward = some farms have no assessment on that date, so their previous result is reused.")
+            if len(et2) > 1:
+                st.line_chart(et2.set_index("date")[["gap_pct"]], y_label="estate gap %")
+
+
+# =========================================================================== imagery compare
+S2_EXPORT_LAYERS = ["B02", "B03", "B04", "B05", "B08", "B11", "NDVI", "NDRE", "GNDVI", "NDMI", "MNDWI", "SAVI"]
+
+
+def imagery_page():
+    st.title("Imagery comparison (swipe)")
+    st.caption("Compare two observation windows for one field. The composite for each window is the same product the analysis uses "
+               "(median of valid observations). Differences can be crop change, but also cloud, haze, sun angle or processing changes.")
+    farms = farms_df()
+    if farms.empty:
+        st.info("Import a farm first."); return
+    label = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in farms.itertuples()}
+    keys = list(label)
+    cur = next((i for i, k in enumerate(keys) if label[k] == S.farm_pk), 0)
+    farm_pk = label[st.selectbox("Farm", keys, index=cur, key="img_farm")]
+    vpk = db.current_version(conn, farm_pk)
+    fields = db.get_fields(conn, vpk)
+    fid = st.selectbox("Field", fields[fields.status != "rejected"].field_id.tolist(), key="img_field")
+    geom = fields[fields.field_id == fid].iloc[0].geometry
+    c = st.columns(3)
+    layer = c[0].selectbox("Layer", imagery.LAYERS)
+    src = c[1].radio("Source", ["Demo (synthetic)", "Sentinel-2/1 (Copernicus CDSE)"])
+    mode = c[2].radio("View", ["Swipe", "Side by side"], horizontal=True)
+    prov = DemoProvider() if src.startswith("Demo") else CDSEProvider()
+    ok = True
+    if not prov.synthetic and not prov.configured:
+        st.error("CDSE credentials not set (see README)."); ok = False
+    if layer.startswith("Sentinel-1") and not prov.synthetic:
+        od = st.selectbox("Sentinel-1 orbit direction", ["ASCENDING", "DESCENDING", "(mixed)"])
+        prov.orbit_direction = None if od.startswith("(") else od
+    t = date.today()
+    d = st.columns(4)
+    a0 = d[0].date_input("Window A from", t - timedelta(days=120)); a1 = d[1].date_input("Window A to", t - timedelta(days=61))
+    b0 = d[2].date_input("Window B from", t - timedelta(days=60)); b1 = d[3].date_input("Window B to", t)
+    jobs = jobs_df()
+    jobs = jobs[jobs.farm_pk == farm_pk] if len(jobs) else jobs
+    overlay = st.checkbox("Overlay candidate gaps from an analysis job (window B)", value=False, disabled=jobs.empty)
+    gaps_wgs = None
+    if overlay and not jobs.empty:
+        lab = {f"Job {r.id} - {r.created_at[:16]} - {r.source}": int(r.id) for r in jobs.itertuples()}
+        jp = lab[st.selectbox("Job", list(lab))]
+        gj = db.job_gaps(conn, jp)
+        gaps_wgs = list(gj[gj.field_id == fid].geometry)
+        st.caption("Red outlines = predicted candidate gaps (unverified).")
+    if st.button("Render comparison", type="primary", disabled=not ok):
+        try:
+            with st.spinner("Retrieving and rendering..."):
+                S.img = {"pair": imagery.render_pair(prov, geom, fid, layer, (a0, a1), (b0, b1), gaps_wgs=gaps_wgs),
+                         "layer": layer, "field": fid, "mode": mode, "tif": {}}
+        except Exception as e:  # noqa: BLE001
+            S.img = None
+            st.error(f"Could not retrieve imagery: {e}")
+    m = S.get("img")
+    if not m or m["field"] != fid:
+        return
+    pair = m["pair"]
+    if pair["a"]["synthetic"]:
+        st.error("SYNTHETIC DEMO DATA - not satellite imagery.", icon="🧪")
+    q = st.columns(2)
+    for col, tag in zip(q, "ab"):
+        pr = pair[tag]
+        col.metric(f"Window {tag.upper()} valid observations", f"{pr['valid_fraction']:.0%}", help=f"{pr['range'][0]} to {pr['range'][1]}")
+        if pr["valid_fraction"] < 0.6:
+            col.warning("Low valid coverage (cloud/shadow/no data): comparison is unreliable.")
+    la = f"A: {pair['a']['range'][0]} → {pair['a']['range'][1]}"
+    lb = f"B: {pair['b']['range'][0]} → {pair['b']['range'][1]}"
+    ra, rb = pair["a"]["rgba"], pair["b"]["rgba"]
+    scale = max(1, 8 // max(1, int(max(ra.shape[:2]) // 40)))
+    if m["mode"] == "Swipe":
+        page_html, h = imagery.swipe_html(imagery.to_data_uri(ra, 6), imagery.to_data_uri(rb, 6), la, lb, ra.shape[1] / ra.shape[0])
+        components.html(page_html, height=h, scrolling=False)
+        st.caption("Drag the slider: left = window A, right = window B.")
+    else:
+        l, r = st.columns(2)
+        l.image(imagery.to_data_uri(ra, 6), caption=la); r.image(imagery.to_data_uri(rb, 6), caption=lb)
+    st.caption(f"{m['layer']}: {imagery.LEGENDS[m['layer']]} Grey = no valid observation; outside the field is transparent.")
+    with st.expander("Observation metadata"):
+        st.json({"A": pair["a"]["scenes"], "B": pair["b"]["scenes"]}, expanded=False)
+    st.subheader("Raster export (GeoTIFF)")
+    lay = st.multiselect("Bands / indices to export", S2_EXPORT_LAYERS, default=["B04", "B08", "NDVI"])
+    e1, e2 = st.columns(2)
+    for col, tag in ((e1, "a"), (e2, "b")):
+        if col.button(f"Build GeoTIFF for window {tag.upper()}", disabled=not lay):
+            m["tif"][tag] = rasters.composite_to_geotiff(pair[tag]["comp"], geom, lay, tags={"FIELD": fid, "WINDOW": " to ".join(pair[tag]["range"])})
+            log("export_composite_geotiff", f"{fid} window {tag}")
+        if tag in m["tif"]:
+            col.download_button(f"Download window {tag.upper()} GeoTIFF", m["tif"][tag], f"{fid}_window_{tag}.tif", "image/tiff")
+
+
+# =========================================================================== users and audit
+def users_page():
+    st.title("Users and audit log")
+    if not auth.can(ROLE, "admin"):
+        st.error("Administrators only."); return
+    t1, t2, t3 = st.tabs(["Users", "Create user", "Audit log"])
+    users = auth.list_users(conn)
+    allf = db.list_farms(conn)
+    with t1:
+        st.dataframe(users, hide_index=True, width="stretch")
+        name = st.selectbox("Manage user", users.username.tolist())
+        u = auth.get_user(conn, name)
+        c = st.columns(3)
+        role = c[0].selectbox("Role", list(auth.ROLES), index=list(auth.ROLES).index(u["role"]))
+        if c[0].button("Apply role"):
+            try:
+                auth.set_role(conn, name, role, user["username"]); st.success("Updated."); st.rerun()
+            except auth.AuthError as e:
+                st.error(str(e))
+        if c[1].button("Deactivate" if u["active"] else "Reactivate"):
+            try:
+                auth.set_active(conn, name, not u["active"], user["username"]); st.rerun()
+            except auth.AuthError as e:
+                st.error(str(e))
+        with c[2].form("reset"):
+            npw = st.text_input("Temporary password", type="password")
+            if st.form_submit_button("Reset password"):
+                try:
+                    auth.change_password(conn, name, None, npw, user["username"], admin_reset=True)
+                    st.success("Reset; the user must change it at next sign-in.")
+                except auth.AuthError as e:
+                    st.error(str(e))
+        st.markdown("**Farm access**")
+        every = st.checkbox("Access to all farms", value=bool(u["all_farms"]), key=f"allf_{name}")
+        flab = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in allf.itertuples()}
+        chosen = st.multiselect("Allowed farms", list(flab), default=[k for k, v in flab.items() if v in u["farms"]],
+                                disabled=every, key=f"farms_{name}")
+        if st.button("Save farm access"):
+            auth.set_farm_access(conn, name, every, [flab[k] for k in chosen], user["username"]); st.success("Saved.")
+        st.caption("Admins always see every farm. Viewers can look and export; analysts can also import, run, review and train.")
+    with t2:
+        with st.form("new_user"):
+            c = st.columns(3)
+            un = c[0].text_input("Username"); dn = c[1].text_input("Display name"); rl = c[2].selectbox("Role", list(auth.ROLES))
+            pw = st.text_input(f"Initial password (min {auth.MIN_PW_LEN}, letters and digits)", type="password")
+            every = st.checkbox("Access to all farms", value=True)
+            chosen = st.multiselect("...or only these farms", [f"{r.farm_name} ({r.farm_id})" for r in allf.itertuples()])
+            force = st.checkbox("Require password change at first sign-in", value=True)
+            if st.form_submit_button("Create user", type="primary"):
+                try:
+                    flab = {f"{r.farm_name} ({r.farm_id})": int(r.farm_pk) for r in allf.itertuples()}
+                    auth.create_user(conn, un, pw, rl, dn or None, every, [flab[k] for k in chosen], force, user["username"])
+                    st.success(f"Created {un}."); st.rerun()
+                except auth.AuthError as e:
+                    st.error(str(e))
+    with t3:
+        lg = auth.audit_log(conn, 2000)
+        st.dataframe(lg, hide_index=True, width="stretch")
+        st.download_button("Download audit log (CSV)", lg.to_csv(index=False), "audit_log.csv", "text/csv")
 
 
 def fmt(x, d=3):
@@ -707,7 +1380,7 @@ def validation_page():
     st.markdown("Record independent field observations, then score a job's predictions. **Reference polygons must come "
                 "from ground survey or drone interpretation, not from the model's own output.** Only fields marked "
                 "*fully surveyed* are scored; a surveyed field with no polygons means *no gaps found*.")
-    jobs = db.list_jobs(conn, S.farm_pk) if S.farm_pk else db.list_jobs(conn)
+    jobs = jobs_df()
     if jobs.empty:
         st.info("Run an analysis first."); return
     labels = {f"Job {r.id} - {r.created_at[:16]} - {r.source}": int(r.id) for r in jobs.itertuples()}
@@ -750,17 +1423,19 @@ def validation_page():
             full = st.multiselect("Fields FULLY surveyed (include fields where you found no gaps)",
                                   sorted(fields.field_id), default=sorted(set(ref_assigned.field_id)))
             notes = st.text_input("Notes (e.g. survey protocol)")
-            if st.button("Save reference survey", disabled=not full):
+            if st.button("Save reference survey", disabled=(not full) or RO):
                 for fid in full:
                     polys = list(ref_assigned[ref_assigned.field_id == fid].geometry)
                     db.add_survey(conn, farm_pk, vpk, fid, obs_date, observer, method, True, notes, polys)
+                    log("survey_saved", f"farm {farm_pk} field {fid}")
+                log("survey_saved", f"farm {farm_pk} field {fid}")
                 st.success(f"Saved survey records for {len(full)} field(s)."); st.rerun()
         sv = db.list_surveys(conn, vpk)
         if len(sv):
             st.dataframe(sv, hide_index=True, width="stretch")
             d = st.selectbox("Delete a survey record", [None] + sv.survey_pk.tolist())
-            if d and st.button("Delete survey"):
-                db.delete_survey(conn, int(d)); st.rerun()
+            if d and st.button("Delete survey", disabled=not auth.can(ROLE, "admin")):
+                db.delete_survey(conn, int(d)); log("survey_deleted", str(d)); st.rerun()
         else:
             st.info("No reference surveys recorded for this boundary version yet.")
 
@@ -768,9 +1443,10 @@ def validation_page():
         c1, c2 = st.columns(2)
         min_ov = c1.slider("Polygon match: minimum overlap fraction", 0.1, 1.0, 0.5, 0.05)
         max_days = c2.number_input("Flag surveys further than N days from imagery end", 1, 365, 30)
-        if st.button("Run accuracy assessment", type="primary"):
+        if st.button("Run accuracy assessment", type="primary", disabled=RO):
             ev = validation.evaluate_job(conn, job_pk, min_ov, int(max_days))
             db.save_validation(conn, job_pk, ev); S.last_ev = (job_pk, ev)
+            log("validation_run", f"job {job_pk}")
         job_ev = S.get("last_ev")
         if not job_ev or job_ev[0] != job_pk:
             st.info("Run the assessment to see results (each run is stored with its settings)."); return
@@ -836,5 +1512,8 @@ def validation_page():
                 "score on different ones.")
 
 
-{"Farm and Field Explorer": explorer, "Results and Review": results, "Interventions": interventions_page, "Validation": validation_page, "Machine Learning": ml_page,
- "Method and Limits": method}[page]()
+S.entered_run = (page == "Run Analysis" and S.get("_prev_page") != "Run Analysis")
+{"Farm and Field Explorer": explorer, "Run Analysis": run_page, "Results and Review": results, "Dashboards": dashboards_page,
+ "Imagery Compare": imagery_page, "Interventions": interventions_page, "Validation": validation_page,
+ "Machine Learning": ml_page, "Method and Limits": method, "Users and Audit": users_page}[page]()
+S._prev_page = page

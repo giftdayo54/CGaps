@@ -396,3 +396,26 @@ def validate_geojson(
         "total_usable_area_ha": round(float(fields[fields.status != "rejected"]["area_ha"].sum()), 2),
     }
     return ValidationResult(gdf, summary, dataset_issues, mapping, crs)
+
+
+def subset_validation(vr: ValidationResult, field_ids) -> ValidationResult:
+    """Keep only the chosen fields (plus any farm outlines) from a validation result.
+
+    Used when the user imports only part of a farm file. Features that are dropped are listed in the dataset issues and
+    stay in the stored import report's source file name, so nothing disappears silently."""
+    keep = {str(f) for f in field_ids}
+    f = vr.features
+    mask = f["is_outline"] | f["field_id"].astype(str).isin(keep)
+    sub = f[mask & (f["status"] != "rejected")].copy() if not f["is_outline"].all() else f[mask].copy()
+    dropped = f[~mask]
+    issues = list(vr.dataset_issues)
+    if len(dropped):
+        names = ", ".join(map(str, dropped["field_id"].tolist()[:12])) + (" ..." if len(dropped) > 12 else "")
+        issues.append(f"{len(dropped)} feature(s) NOT imported by user selection: {names}")
+    fields = sub[~sub["is_outline"]]
+    summary = dict(vr.summary)
+    summary.update({"n_features": int(len(sub)), "n_fields": int(len(fields)),
+                    "accepted": int((fields.status == "accepted").sum()), "repaired": int((fields.status == "repaired").sum()),
+                    "warning": int((fields.status == "warning").sum()), "rejected": 0, "not_imported": int(len(dropped)),
+                    "total_usable_area_ha": round(float(fields["area_ha"].sum()), 2)})
+    return ValidationResult(sub, summary, issues, dict(vr.mapping), vr.source_crs)

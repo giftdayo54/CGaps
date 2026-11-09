@@ -193,3 +193,76 @@ def test_cdse_s1_payload_and_parsing(monkeypatch):
     seen["ok"] = False
     with pytest.raises(CDSEUnavailable, match="500"):
         p.get_s1_composite(bounds, "EPSG:32736", "2026-08-01", "2026-09-01")
+
+
+def _cal_data(rng, n=4000, groups=5, overconfident=True):
+    g = rng.integers(0, groups, n)
+    true_p = rng.uniform(0.02, 0.98, n)
+    y = (rng.uniform(size=n) < true_p).astype(int)
+    # a miscalibrated score: pushed towards 0/1
+    raw = np.clip(0.5 + (true_p - 0.5) * (1.9 if overconfident else 1.0), 0.001, 0.999)
+    return raw, y, np.ones(n), g
+
+
+@pytest.mark.parametrize("method", ["sigmoid", "isotonic"])
+def test_calibration_reduces_error_with_crossfitting(method):
+    p, y, w, g = _cal_data(np.random.default_rng(1))
+    rep, cal = ml.calibration_report(p, y, w, g, method)
+    assert rep["ece_calibrated_crossfit"] < rep["ece_raw"] and rep["brier_calibrated_crossfit"] <= rep["brier_raw"]
+    out = cal.predict(p)
+    assert out.min() >= 0 and out.max() <= 1
+    assert abs(np.average(out, weights=w) - y.mean()) < 0.03          # mean probability matches prevalence
+
+
+def test_calibration_needs_groups_and_both_classes():
+    p, y, w, g = _cal_data(np.random.default_rng(2), groups=2)
+    with pytest.raises(ml.InsufficientData):
+        ml.calibration_report(p, y, w, g, "isotonic")
+    with pytest.raises(ValueError):
+        ml.fit_calibrator(p, y, w, "magic")
+
+
+def test_train_model_with_calibration_and_roundtrip(conn, tmp_path):
+    ids = _farm(conn)
+    df, _ = _train(conn, ids, max_per_class=300)
+    b = ml.train_model(df, "s2", rf_params=ml.default_rf_params(n_estimators=30, n_jobs=1), n_splits=3, synthetic=True,
+                       calibration="isotonic")
+    assert b.calibrator is not None and b.meta["calibration"]["method"] == "isotonic" and "_oof" not in b.meta["cv"]
+    mid = ml.register_model(conn, b, "cal", tmp_path)
+    assert db.list_models(conn).iloc[0].calibrated == 1
+    b2 = ml.load_bundle(db.get_model_row(conn, mid)["path"])
+    X = df[b.feature_names].to_numpy("float32")[:40]
+    np.testing.assert_allclose(b.predict_proba(X), b2.predict_proba(X))
+
+
+def test_calibration_skipped_when_cv_impossible(conn):
+    ids = _farm(conn, survey_fields=["F01", "F02"])
+    df, _ = _train(conn, ids)
+    b = ml.train_model(df, "s2", rf_params=ml.default_rf_params(n_estimators=20, n_jobs=1), synthetic=True, calibration="sigmoid")
+    assert b.calibrator is None and "Not calibrated" in b.meta["calibration_note"]
+
+
+def test_cdse_s2_payload_requests_blue_band_and_parses_seven_layers(monkeypatch):
+    from rasterio.io import MemoryFile
+    from rasterio.transform import from_origin
+    from canegap.providers import CDSEProvider, cdse
+    bounds = (600000, 8230000, 600200, 8230200)
+    _, h, w = make_grid(bounds, 10)
+    vals = [0.03, 0.07, 0.04, 0.12, 0.42, 0.17, 5]               # B02,B03,B04,B05,B08,B11,count
+    arr = np.stack([np.full((h, w), v) for v in vals]).astype("float32")
+    with MemoryFile() as mf:
+        with mf.open(driver="GTiff", height=h, width=w, count=7, dtype="float32", crs="EPSG:32736",
+                     transform=from_origin(0, 0, 10, 10)) as ds:
+            ds.write(arr)
+        tiff = mf.read()
+    seen = {}
+
+    class R:
+        status_code, content, text = 200, tiff, ""
+
+    monkeypatch.setattr(cdse.requests, "post", lambda url, json=None, headers=None, **k: (seen.update(p=json), R())[1])
+    p = CDSEProvider("i", "s"); p._token, p._token_exp = "t", 1e12
+    c = p.get_composite(bounds, "EPSG:32736", "2026-08-01", "2026-09-01")
+    assert '"B02"' in seen["p"]["evalscript"] and "bands: 7" in seen["p"]["evalscript"]
+    assert set(c.bands) == {"B02", "B03", "B04", "B05", "B08", "B11"} and c.bands["B08"].mean() == pytest.approx(0.42)
+    assert c.obs_count.max() == 5

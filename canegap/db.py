@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS fields(
 CREATE TABLE IF NOT EXISTS jobs(
   id INTEGER PRIMARY KEY, farm_pk INTEGER, version_pk INTEGER, field_ids TEXT, source TEXT,
   synthetic INTEGER, date_from TEXT, date_to TEXT, params_json TEXT, algo_version TEXT,
-  overlap_policy TEXT, status TEXT, error TEXT, created_at TEXT, finished_at TEXT);
+  overlap_policy TEXT, status TEXT, error TEXT, created_at TEXT, finished_at TEXT,
+  progress_done INTEGER DEFAULT 0, progress_total INTEGER DEFAULT 0, current_field TEXT,
+  cancel_requested INTEGER DEFAULT 0, created_by TEXT, fingerprint TEXT);
 CREATE TABLE IF NOT EXISTS field_results(
   id INTEGER PRIMARY KEY, job_pk INTEGER NOT NULL REFERENCES jobs(id),
   field_row_pk INTEGER REFERENCES fields(id), field_id TEXT, status TEXT, reason TEXT,
@@ -67,7 +69,18 @@ CREATE TABLE IF NOT EXISTS models(
   id INTEGER PRIMARY KEY, name TEXT, created_at TEXT, feature_set TEXT, features_json TEXT, use_s1_change INTEGER,
   threshold REAL, synthetic INTEGER, n_fields INTEGER, n_pos_samples INTEGER, n_neg_samples INTEGER,
   field_ids_json TEXT, cv_validated INTEGER, cv_json TEXT, cv_note TEXT, importances_json TEXT,
-  rf_params_json TEXT, provenance_json TEXT, sklearn_version TEXT, path TEXT);
+  rf_params_json TEXT, provenance_json TEXT, sklearn_version TEXT, path TEXT, calibration_json TEXT);
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, display_name TEXT, role TEXT NOT NULL,
+  pw_hash TEXT NOT NULL, active INTEGER DEFAULT 1, all_farms INTEGER DEFAULT 1, failed_attempts INTEGER DEFAULT 0,
+  locked_until TEXT, must_change_pw INTEGER DEFAULT 0, created_at TEXT, last_login TEXT);
+CREATE TABLE IF NOT EXISTS user_farms(
+  user_id INTEGER NOT NULL REFERENCES users(id), farm_pk INTEGER NOT NULL, PRIMARY KEY(user_id, farm_pk));
+CREATE TABLE IF NOT EXISTS audit(
+  id INTEGER PRIMARY KEY, ts TEXT, username TEXT, action TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS field_attr_history(
+  id INTEGER PRIMARY KEY, version_pk INTEGER, field_id TEXT, attr TEXT, old_value TEXT, new_value TEXT,
+  changed_by TEXT, changed_at TEXT, source TEXT);
 """
 
 
@@ -86,8 +99,27 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=15000")        # worker threads and the UI share the file
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.DatabaseError:
+        pass
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn):
+    """Add columns introduced after a database file was first created."""
+    wanted = {"models": {"calibration_json": "TEXT"},
+              "jobs": {"progress_done": "INTEGER DEFAULT 0", "progress_total": "INTEGER DEFAULT 0", "current_field": "TEXT",
+                       "cancel_requested": "INTEGER DEFAULT 0", "created_by": "TEXT", "fingerprint": "TEXT"}}
+    for table, cols in wanted.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols.items():
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.commit()
 
 
 def _scalar(v):
@@ -198,7 +230,7 @@ def current_version(conn, farm_pk: int) -> int | None:
 def get_fields(conn, version_pk: int, include_outlines: bool = False) -> gpd.GeoDataFrame:
     q = "SELECT * FROM fields WHERE version_pk=?" + ("" if include_outlines else " AND is_outline=0")
     df = pd.read_sql_query(q, conn, params=(version_pk,))
-    geoms = [shape(json.loads(g)) if g else None for g in df.pop("geom_json")]
+    geoms = [shape(json.loads(g)) if isinstance(g, str) and g else None for g in df.pop("geom_json")]
     return gpd.GeoDataFrame(df, geometry=geoms, crs="EPSG:4326").rename(columns={"id": "row_pk"})
 
 
@@ -233,14 +265,55 @@ def boundary_diff(conn, v_from: int, v_to: int) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- jobs/results
 def create_job(conn, farm_pk, version_pk, field_ids, source, synthetic, date_from, date_to, params,
-               algo_version, overlap_policy) -> int:
+               algo_version, overlap_policy, status="running", created_by=None, fingerprint=None) -> int:
     jid = conn.execute(
         "INSERT INTO jobs(farm_pk,version_pk,field_ids,source,synthetic,date_from,date_to,params_json,"
-        "algo_version,overlap_policy,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "algo_version,overlap_policy,status,created_at,progress_total,created_by,fingerprint) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (farm_pk, version_pk, json.dumps(field_ids), source, int(synthetic), str(date_from), str(date_to),
-         json.dumps(params), algo_version, overlap_policy, "running", now())).lastrowid
+         json.dumps(params), algo_version, overlap_policy, status, now(), len(field_ids), created_by,
+         fingerprint)).lastrowid
     conn.commit()
     return jid
+
+
+def active_duplicate(conn, fingerprint: str):
+    """An identical job that is still queued or running (prevents accidental double processing)."""
+    return conn.execute("SELECT id FROM jobs WHERE fingerprint=? AND status IN ('queued','running') LIMIT 1",
+                        (fingerprint,)).fetchone()
+
+
+def set_job_running(conn, job_pk):
+    conn.execute("UPDATE jobs SET status='running' WHERE id=? AND status='queued'", (job_pk,)); conn.commit()
+
+
+def update_job_progress(conn, job_pk, done, total, current_field):
+    conn.execute("UPDATE jobs SET progress_done=?, progress_total=?, current_field=? WHERE id=?",
+                 (done, total, current_field, job_pk)); conn.commit()
+
+
+def request_cancel(conn, job_pk) -> bool:
+    cur = conn.execute("UPDATE jobs SET cancel_requested=1 WHERE id=? AND status IN ('queued','running')", (job_pk,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def cancel_requested(conn, job_pk) -> bool:
+    r = conn.execute("SELECT cancel_requested FROM jobs WHERE id=?", (job_pk,)).fetchone()
+    return bool(r and r["cancel_requested"])
+
+
+def get_job(conn, job_pk):
+    return conn.execute("SELECT * FROM jobs WHERE id=?", (job_pk,)).fetchone()
+
+
+def recover_orphans(conn) -> int:
+    """Jobs marked queued/running when the process starts cannot still be running (jobs run in-process)."""
+    cur = conn.execute("UPDATE jobs SET status='interrupted', error='Application restarted while the job was queued or "
+                       "running; completed fields are kept, re-run to finish.', finished_at=? "
+                       "WHERE status IN ('queued','running')", (now(),))
+    conn.commit()
+    return cur.rowcount
 
 
 def finish_job(conn, job_pk, status="completed", error=None):
@@ -444,12 +517,12 @@ def add_model_row(conn, name, b) -> int:
     mid = conn.execute(
         "INSERT INTO models(name,created_at,feature_set,features_json,use_s1_change,threshold,synthetic,n_fields,"
         "n_pos_samples,n_neg_samples,field_ids_json,cv_validated,cv_json,cv_note,importances_json,rf_params_json,"
-        "provenance_json,sklearn_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "provenance_json,sklearn_version,calibration_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (name, now(), b.feature_set, json.dumps(b.feature_names), int(b.use_s1_change), b.threshold, int(b.synthetic),
          m.get("n_fields"), m.get("n_pos_samples"), m.get("n_neg_samples"), json.dumps(m.get("field_ids")),
          int(bool(m.get("cv"))), json.dumps(m.get("cv"), default=float), m.get("cv_note"),
          json.dumps(m.get("importances")), json.dumps(m.get("rf_params")), json.dumps(m.get("provenance"), default=str),
-         sklearn.__version__)).lastrowid
+         sklearn.__version__, json.dumps(m.get("calibration"), default=float))).lastrowid
     conn.commit()
     return mid
 
@@ -461,7 +534,7 @@ def set_model_path(conn, mid: int, path: str):
 def list_models(conn) -> pd.DataFrame:
     return pd.read_sql_query(
         "SELECT id,name,created_at,feature_set,use_s1_change,threshold,synthetic,n_fields,n_pos_samples,n_neg_samples,"
-        "cv_validated,cv_note FROM models ORDER BY id DESC", conn)
+        "cv_validated,cv_note,(calibration_json IS NOT NULL AND calibration_json!='null') calibrated FROM models ORDER BY id DESC", conn)
 
 
 def get_model_row(conn, mid: int):
@@ -474,3 +547,44 @@ def delete_model(conn, mid: int):
         from pathlib import Path
         Path(r["path"]).unlink(missing_ok=True)
     conn.execute("DELETE FROM models WHERE id=?", (mid,)); conn.commit()
+
+
+# --------------------------------------------------------------- field attributes
+def update_field_attributes(conn, version_pk: int, changes: dict[str, dict], user: str | None = None,
+                            source: str = "manual") -> dict:
+    """Validate and apply manual attribute edits {field_id: {attr: value}} to one boundary version.
+
+    All-or-nothing: if any value is invalid nothing is written. Every changed value is recorded in
+    field_attr_history. Geometry is never touched. Returns {"changed": n_values, "fields": n_fields, "warnings": [...]}."""
+    from . import attributes as A
+    clean, errors, warnings = A.clean_changes(changes)
+    if errors:
+        raise A.AttributeError_("; ".join(errors))
+    rows = {r["field_id"]: r for r in conn.execute(
+        "SELECT * FROM fields WHERE version_pk=? AND is_outline=0", (version_pk,))}
+    unknown = [f for f in clean if f not in rows]
+    if unknown:
+        raise A.AttributeError_(f"Unknown field(s) in this boundary version: {', '.join(unknown)}")
+    n_vals, n_fields = 0, 0
+    ts = now()
+    with conn:                                           # one transaction
+        for fid, attrs in clean.items():
+            touched = False
+            for k, new in attrs.items():
+                old = rows[fid][k]
+                if (old or None) == (new or None):
+                    continue
+                conn.execute(f"UPDATE fields SET {k}=? WHERE id=?", (new, rows[fid]["id"]))
+                conn.execute("INSERT INTO field_attr_history(version_pk,field_id,attr,old_value,new_value,changed_by,"
+                             "changed_at,source) VALUES(?,?,?,?,?,?,?,?)", (version_pk, fid, k, old, new, user, ts, source))
+                n_vals += 1; touched = True
+            n_fields += int(touched)
+    return {"changed": n_vals, "fields": n_fields, "warnings": warnings}
+
+
+def attribute_history(conn, version_pk: int, field_id: str | None = None) -> pd.DataFrame:
+    q = "SELECT changed_at,field_id,attr,old_value,new_value,changed_by,source FROM field_attr_history WHERE version_pk=?"
+    args = [version_pk]
+    if field_id:
+        q += " AND field_id=?"; args.append(field_id)
+    return pd.read_sql_query(q + " ORDER BY id DESC", conn, params=args)
