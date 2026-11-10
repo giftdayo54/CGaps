@@ -20,7 +20,7 @@ from canegap.geojson_import import (MAPPING_KEYS, CRSNeedsConfirmation, ImportEr
 from canegap.jobs import JobRunner
 from canegap.pipeline import DuplicateJob, Params, execute_job, queue_analysis, run_analysis
 from canegap.providers import CDSEProvider, DemoProvider
-from canegap.ui_helpers import base_map, field_at_point, results_map, selection_map, toggle_selection
+from canegap.ui_helpers import base_map, checked_ids, field_at_point, results_map, selection_map, toggle_selection
 
 st.set_page_config(page_title="CaneGap Intelligence", page_icon="🌾", layout="wide")
 
@@ -297,6 +297,7 @@ def import_selection(vr, filename):
     tbl = S.imp_attrs.merge(info, on="field_id", how="left")
     tbl = tbl[["field_id", "field_name", "area_ha", "status", "variety", "ratoon_number", "planting_date", "last_harvest_date",
                "crop", "irrigation_system", "issues"]]
+    tbl = tbl.loc[:, ~tbl.columns.duplicated()]
     tbl.insert(0, "select", tbl.field_id.isin(S.imp_sel))
     edited = st.data_editor(
         tbl, hide_index=True, width="stretch", key=f"impedit_{S.get('imp_ver', 0)}",
@@ -306,7 +307,7 @@ def import_selection(vr, filename):
                        "last_harvest_date": st.column_config.TextColumn("Last harvest", help="YYYY-MM-DD"),
                        "ratoon_number": st.column_config.TextColumn("Ratoon", help="0 = plant cane")})
     cur_attrs = attributes.text_frame(edited, ["field_id"] + attributes.EDITABLE)
-    cur_sel = set(edited[edited.select].field_id) & usable
+    cur_sel = checked_ids(edited) & usable
     n_sel = len(cur_sel)
     st.markdown(f"**{n_sel} of {len(usable)} usable fields selected - combined area "
                 f"{feats[feats.field_id.isin(cur_sel)].area_ha.sum():,.2f} ha**")
@@ -497,7 +498,7 @@ def field_selection(farm_pk: int):
         column_config={"area_ha": st.column_config.NumberColumn("Area (ha)", format="%.2f"),
                        "status": st.column_config.TextColumn("Boundary validation")})
     shown = set(tbl.field_id)
-    chosen = set(edited[edited.select].field_id)
+    chosen = checked_ids(edited)
     S.sel_ids = (S.sel_ids - shown) | chosen
     rejected = set(fields[fields.status == "rejected"].field_id)
     S.sel_ids -= rejected

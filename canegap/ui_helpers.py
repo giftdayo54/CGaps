@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import folium
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 
 BASEMAPS = {
@@ -91,3 +92,13 @@ def toggle_selection(selected: set, field_id: str, allowed: set | None = None) -
     out = set(selected)
     out.symmetric_difference_update({field_id})
     return out
+
+
+def checked_ids(edited: pd.DataFrame, col: str = "select", id_col: str = "field_id") -> set:
+    """Ids whose tick-box is ticked. Robust to the editor returning object/nullable/NaN values instead of bool."""
+    if col not in edited.columns or edited.empty:
+        return set()
+    edited = edited.loc[:, ~edited.columns.duplicated()]          # defensive: never let a duplicate column break selection
+    flags = [v is True or (isinstance(v, (int, float, np.bool_)) and not pd.isna(v) and bool(v)) or
+             (isinstance(v, str) and v.strip().lower() in ("true", "1", "yes")) for v in edited[col].tolist()]
+    return {str(i) for i, f in zip(edited[id_col].tolist(), flags) if f}
