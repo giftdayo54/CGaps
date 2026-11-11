@@ -4,7 +4,8 @@ Endpoints (CDSE documentation):
   token   https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token
   process https://sh.dataspace.copernicus.eu/api/v1/process
 Credentials: OAuth client created in the CDSE dashboard; supply CDSE_CLIENT_ID /
-CDSE_CLIENT_SECRET as environment variables (backend only; never in code or git).
+CDSE_CLIENT_SECRET as environment variables or in Streamlit secrets (.streamlit/secrets.toml or the Cloud
+"Secrets" panel). Backend only; never in code or git.
 
 STATUS: written against the documented API but NOT tested against the live service in
 the build environment (no credentials). Test with a small field first. Quotas and terms
@@ -91,8 +92,9 @@ class CDSEProvider(Provider):
 
     def __init__(self, client_id: str | None = None, client_secret: str | None = None,
                  max_cloud_cover: float = 60.0, timeout: int = 120):
-        self.client_id = client_id or os.environ.get("CDSE_CLIENT_ID")
-        self.client_secret = client_secret or os.environ.get("CDSE_CLIENT_SECRET")
+        from ..secrets_util import get_secret
+        self.client_id = client_id or get_secret("CDSE_CLIENT_ID")
+        self.client_secret = client_secret or get_secret("CDSE_CLIENT_SECRET")
         self.max_cloud_cover = max_cloud_cover
         self.timeout = timeout
         self._token = None
@@ -104,7 +106,7 @@ class CDSEProvider(Provider):
 
     def _auth(self) -> str:
         if not self.configured:
-            raise CDSEUnavailable("CDSE_CLIENT_ID / CDSE_CLIENT_SECRET are not set.")
+            raise CDSEUnavailable("CDSE_CLIENT_ID / CDSE_CLIENT_SECRET are not set (environment variables or Streamlit secrets).")
         if self._token and time.time() < self._token_exp - 30:
             return self._token
         r = requests.post(TOKEN_URL, data={

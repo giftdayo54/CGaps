@@ -89,7 +89,8 @@ def now() -> str:
 
 
 def data_dir() -> Path:
-    p = Path(os.environ.get("CANEGAP_DATA_DIR", "data"))
+    from .secrets_util import get_secret
+    p = Path(get_secret("CANEGAP_DATA_DIR", "data"))
     p.mkdir(parents=True, exist_ok=True)
     return p
 

@@ -577,11 +577,14 @@ def run_panel():
     if src.startswith("Sentinel"):
         prov = CDSEProvider()
         if not prov.configured:
-            st.error("CDSE credentials not found. Set CDSE_CLIENT_ID and CDSE_CLIENT_SECRET (see README), "
-                     "or use the demo source.")
+            st.error("CDSE credentials not found. Add CDSE_CLIENT_ID and CDSE_CLIENT_SECRET to your Streamlit secrets "
+                     "(copy `.streamlit/secrets.toml.example`, or paste into the Cloud app's Settings -> Secrets) or set them as "
+                     "environment variables - see README. Or use the demo source.")
             can_run = False
         else:
-            st.caption("Real Sentinel-2 retrieval - provider code is untested against the live service.")
+            from canegap.secrets_util import source_of
+            st.caption(f"Credentials found in: {source_of('CDSE_CLIENT_ID')}. Real Sentinel retrieval - provider code is untested "
+                       f"against the live service, so try one small field first.")
     else:
         st.info("Demo mode generates **synthetic** imagery for testing. Results are not real observations.")
     st.markdown("**Detection method**")
@@ -1033,7 +1036,7 @@ def ml_page():
         src = st.radio("Imagery source for training", ["Demo (synthetic)", "Sentinel-2 + Sentinel-1 (Copernicus CDSE)"], horizontal=True)
         prov = DemoProvider(gap_fraction=0.12) if src.startswith("Demo") else CDSEProvider()
         if not prov.synthetic and not prov.configured:
-            st.error("CDSE credentials not set (see README)."); prov = None
+            st.error("CDSE credentials not set: add them to Streamlit secrets (see .streamlit/secrets.toml.example) or environment variables."); prov = None
         if prov is not None and prov.synthetic:
             st.info("Synthetic mode: you can generate SYNTHETIC reference surveys from the generator to test the workflow. "
                     "Results say nothing about real performance.")
@@ -1248,7 +1251,7 @@ def imagery_page():
     prov = DemoProvider() if src.startswith("Demo") else CDSEProvider()
     ok = True
     if not prov.synthetic and not prov.configured:
-        st.error("CDSE credentials not set (see README)."); ok = False
+        st.error("CDSE credentials not set: add them to Streamlit secrets (see .streamlit/secrets.toml.example) or environment variables."); ok = False
     if layer.startswith("Sentinel-1") and not prov.synthetic:
         od = st.selectbox("Sentinel-1 orbit direction", ["ASCENDING", "DESCENDING", "(mixed)"])
         prov.orbit_direction = None if od.startswith("(") else od

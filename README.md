@@ -71,7 +71,7 @@ quantification, farm roll-ups, review/verification and GIS exports.
   Planting and harvest dates drive the recently-harvested / newly-planted rules; if a selected field has neither, Run Analysis
   warns you and the field's result carries a note. Each job **freezes the attribute values it used** (shown in the field PDF
   and the job record), so editing attributes later never rewrites past results, and a changed attribute makes a new job, not a duplicate.
-- **Tests**: `pytest` (118 tests) incl. import validation, clipping/attribution, aggregation, versioning, exports, validation metrics
+- **Tests**: `pytest` (126 tests) incl. import validation, clipping/attribution, aggregation, versioning, exports, validation metrics
   with hand-computed values, app smoke tests.
 
 ## Not built yet (next stages)
@@ -131,12 +131,24 @@ deliberately weak, so S1-only scores poorly; that is a property of the generator
 Sidebar -> **Run Analysis**. Steps: import/select a farm in *Farm and Field Explorer* -> (optionally click fields on the map) ->
 **Run Analysis** -> choose source (Demo works without credentials) -> *Run Gap Analysis* -> *Open results*.
 
-## Real Sentinel-2 data (Copernicus Data Space Ecosystem)
-1. Register at dataspace.copernicus.eu, then create an OAuth client in the Sentinel Hub dashboard.
-2. Copy `.env.example` to `.env` values into your environment (PowerShell: `$env:CDSE_CLIENT_ID="..."; $env:CDSE_CLIENT_SECRET="..."`)
-   before `streamlit run app.py`. Never commit credentials. On Streamlit Community Cloud use app Secrets exposed as env vars.
-3. Choose "Sentinel-2 L2A (Copernicus CDSE)". Usage is limited by your CDSE account quotas (Processing Units) and terms; check them.
-Per-pixel median of SCL-valid observations (cloud, shadow, cirrus, snow excluded) is built by the service for each field's bounding box.
+## Real Sentinel data: credentials via Streamlit secrets
+1. Register at dataspace.copernicus.eu and create an **OAuth client** in the Sentinel Hub dashboard
+   (https://shapps.dataspace.copernicus.eu/dashboard/ -> User settings -> OAuth clients). Note the client id and secret.
+2. Put them in **Streamlit secrets** (the app reads secrets first-class; environment variables also work and take priority):
+   - **Local:** copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and replace the `PASTE-...` values
+     (that file is git-ignored; never commit it).
+   - **Streamlit Community Cloud:** open the app -> **Settings -> Secrets** and paste:
+     ```toml
+     CDSE_CLIENT_ID = "your-client-id"
+     CDSE_CLIENT_SECRET = "your-client-secret"
+     ```
+     (the nested form `[cdse] client_id = ... / client_secret = ...` works too). Save, then reboot the app.
+3. On **Run Analysis** choose "Sentinel-2 L2A (Copernicus CDSE)"; the page tells you where the credentials were found (never their values).
+Optional secrets: `CANEGAP_ADMIN_USER` + `CANEGAP_ADMIN_PASSWORD` (seed the admin so nobody else can claim it on a public URL),
+`CANEGAP_AUTH`, `CANEGAP_DATA_DIR`. Template values starting with `PASTE`/`YOUR-` are ignored.
+Usage is limited by your CDSE quotas (Processing Units) and terms. Per-pixel median of SCL-valid observations is built by the
+service for each field's bounding box. **Streamlit Cloud caveat:** its disk is ephemeral, so the SQLite library/models are lost
+when the app restarts; use a host with a persistent volume (or a hosted database) for real work.
 
 ## Data and deployment
 - Data lives in `data/canegap.sqlite` (override with `CANEGAP_DATA_DIR`). Back it up; it is the boundary library and audit trail.

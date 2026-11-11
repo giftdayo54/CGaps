@@ -33,7 +33,8 @@ class AuthError(ValueError):
 
 
 def enabled() -> bool:
-    return os.environ.get("CANEGAP_AUTH", "on").strip().lower() not in ("off", "0", "false", "no")
+    from .secrets_util import get_secret
+    return (get_secret("CANEGAP_AUTH", "on") or "on").strip().lower() not in ("off", "0", "false", "no")
 
 
 def can(role: str | None, perm: str) -> bool:
@@ -114,7 +115,8 @@ def create_user(conn, username: str, password: str, role: str = "viewer", displa
 
 def seed_admin_from_env(conn) -> bool:
     """Create the first admin from CANEGAP_ADMIN_USER / CANEGAP_ADMIN_PASSWORD (headless deployments)."""
-    u, p = os.environ.get("CANEGAP_ADMIN_USER"), os.environ.get("CANEGAP_ADMIN_PASSWORD")
+    from .secrets_util import get_secret
+    u, p = get_secret("CANEGAP_ADMIN_USER"), get_secret("CANEGAP_ADMIN_PASSWORD")
     if u and p and not has_users(conn):
         create_user(conn, u, p, "admin", actor="bootstrap")
         return True
